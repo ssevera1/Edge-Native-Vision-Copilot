@@ -1,0 +1,37 @@
+%% C4 Level 4 — Code-Level Sequence (per-frame hot path)
+%% Latency budget: ≤33 ms per frame at 30 fps.
+
+sequenceDiagram
+    participant P as run_pipeline()
+    participant FG as frame_generator()
+    participant HD as HelmetDetector
+    participant ORT as onnxruntime Session
+    participant SF as SensorFusion
+    participant LOG as Logger / Alert Sink
+
+    P->>FG: next()
+    FG-->>P: (idx, frame: ndarray)
+
+    Note right of P: Acoustic score arrives<br/>from sensor or simulation
+
+    P->>HD: detect(frame)
+    alt ONNX model loaded
+        HD->>HD: cv2.resize(224×224) + normalize
+        HD->>ORT: session.run(input=blob)
+        ORT-->>HD: scores[helmet, no_helmet]
+        HD->>HD: argmax → label + confidence
+    else Simulation mode
+        HD->>HD: random label + confidence
+    end
+    HD-->>P: DetectionResult
+
+    P->>SF: evaluate(frame, detection, acoustic_score)
+    alt no_helmet AND acoustic > threshold
+        SF-->>P: AlertEvent(...)
+        P->>LOG: log.warning(alert.message)
+    else Safe or single-condition
+        SF-->>P: None
+        P->>LOG: log.info(status OK)
+    end
+
+    Note over P: time.sleep(frame_interval)<br/>throttle to real-time

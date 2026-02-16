@@ -1,0 +1,37 @@
+%% C4 Level 2 — Container Diagram
+%% Shows the internal containers within the Factory Safety Monitor.
+
+graph TB
+    subgraph edge["Edge Device (≤2 GB RAM, ARM/x86)"]
+        direction TB
+
+        ingress["<b>Video Ingress</b><br/><i>[Python / OpenCV]</i><br/>frame_generator()<br/>Reads RTSP or local file,<br/>yields BGR frames"]
+
+        detector["<b>Helmet Detector</b><br/><i>[ONNX Runtime]</i><br/>HelmetDetector class<br/>224×224 input, NCHW<br/>intra_threads=2"]
+
+        fusion["<b>Sensor Fusion Engine</b><br/><i>[Python]</i><br/>SensorFusion class<br/>Dual-condition AND logic:<br/>no_helmet ∧ acoustic > 0.8"]
+
+        alerter["<b>Alert Dispatcher</b><br/><i>[Python / Logging]</i><br/>Formats AlertEvent,<br/>routes to sink"]
+
+        model_store["<b>Model Store</b><br/><i>[Filesystem]</i><br/>models/*.onnx<br/>INT8 quantised weights"]
+    end
+
+    acoustic_in["<b>Acoustic Sensor</b><br/><i>[External]</i>"]
+    camera_in["<b>IP Camera</b><br/><i>[External]</i>"]
+    alert_sink["<b>Alert Sink</b><br/><i>[External]</i>"]
+
+    camera_in -- "RTSP / file<br/>30fps" --> ingress
+    ingress -- "np.ndarray<br/>(H,W,3) uint8" --> detector
+    model_store -. "loads .onnx<br/>at startup" .-> detector
+    detector -- "DetectionResult<br/>{label, conf, bbox}" --> fusion
+    acoustic_in -- "float score<br/>0.0–1.0" --> fusion
+    fusion -- "AlertEvent | None" --> alerter
+    alerter -- "JSON / log" --> alert_sink
+
+    classDef container fill:#1168BD,color:#fff,stroke:none
+    classDef external fill:#999999,color:#fff,stroke:none
+    classDef store fill:#438DD5,color:#fff,stroke:none
+
+    class ingress,detector,fusion,alerter container
+    class model_store store
+    class acoustic_in,camera_in,alert_sink external

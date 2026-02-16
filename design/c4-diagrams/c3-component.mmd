@@ -1,0 +1,44 @@
+%% C4 Level 3 — Component Diagram
+%% Zooms into src/inference.py showing class-level interactions.
+
+graph TB
+    subgraph inference_py["src/inference.py"]
+        direction TB
+
+        main["<b>main()</b><br/><i>[CLI entry point]</i><br/>argparse → run_pipeline()"]
+
+        pipeline["<b>run_pipeline()</b><br/><i>[Orchestrator]</i><br/>Main loop: frame → detect<br/>→ fuse → alert/log"]
+
+        framegen["<b>frame_generator()</b><br/><i>[Generator]</i><br/>cv2.VideoCapture or<br/>synthetic noise fallback"]
+
+        hd["<b>HelmetDetector</b><br/><i>[Class]</i><br/>ONNX session or<br/>simulation fallback<br/>Input: 224×224 NCHW"]
+
+        sf["<b>SensorFusion</b><br/><i>[Class]</i><br/>evaluate(frame, det, score)<br/>→ AlertEvent | None<br/>Rule: no_helmet ∧ score>0.8"]
+
+        dr["<b>DetectionResult</b><br/><i>[Dataclass]</i><br/>label: str<br/>confidence: float<br/>bbox: tuple"]
+
+        ae["<b>AlertEvent</b><br/><i>[Dataclass]</i><br/>frame_index: int<br/>detection: DetectionResult<br/>acoustic_score: float"]
+    end
+
+    subgraph quantize_py["scripts/quantize.py (build-only)"]
+        convert["<b>convert_pytorch_to_onnx()</b><br/><i>[Function]</i><br/>torch.onnx.export()"]
+        quantize["<b>quantize_onnx_model()</b><br/><i>[Function]</i><br/>INT8 dynamic quantisation"]
+    end
+
+    main --> pipeline
+    pipeline --> framegen
+    pipeline --> hd
+    pipeline --> sf
+    hd --> dr
+    sf --> ae
+    convert --> quantize
+
+    classDef cls fill:#1168BD,color:#fff,stroke:none
+    classDef dto fill:#438DD5,color:#fff,stroke:none
+    classDef func fill:#85BBF0,color:#000,stroke:none
+    classDef build fill:#999999,color:#fff,stroke:none
+
+    class hd,sf cls
+    class dr,ae dto
+    class main,pipeline,framegen func
+    class convert,quantize build

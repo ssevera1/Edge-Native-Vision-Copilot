@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Run tests in Docker
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build test image
+        run: docker build --target test -t factory-safety-monitor:test .
+
+      - name: Run tests
+        run: docker run --rm factory-safety-monitor:test
+
+  build-prod:
+    name: Build production image
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build production image
+        run: docker build --target prod -t factory-safety-monitor:latest .
+
+      - name: Verify container starts
+        run: docker run --rm factory-safety-monitor:latest --help

@@ -1,0 +1,26 @@
+%% C4 Level 1 — System Context Diagram
+%% Shows the Factory Safety Monitor and its external actors/systems.
+
+graph TB
+    operator["<b>Factory Operator</b><br/><i>[Person]</i><br/>Monitors safety alerts<br/>on dashboard"]
+
+    fsm["<b>Factory Safety Monitor</b><br/><i>[Software System]</i><br/>Edge-deployed vision + acoustic<br/>fusion system that detects PPE<br/>violations in real-time"]
+
+    cameras["<b>IP Camera Network</b><br/><i>[External System]</i><br/>RTSP/MJPEG video streams<br/>from factory floor"]
+
+    microphones["<b>Acoustic Sensors</b><br/><i>[External System]</i><br/>Anomaly scores from<br/>microphone array"]
+
+    alerting["<b>Alert Sink</b><br/><i>[External System]</i><br/>SCADA / PLC / dashboard /<br/>SMS gateway"]
+
+    cameras -- "Video frames<br/>(BGR, 640x480, 30fps)" --> fsm
+    microphones -- "Acoustic anomaly score<br/>(float 0.0–1.0)" --> fsm
+    fsm -- "AlertEvent<br/>(JSON payload)" --> alerting
+    fsm -- "Real-time feed +<br/>alert overlays" --> operator
+
+    classDef person fill:#08427B,color:#fff,stroke:none
+    classDef system fill:#1168BD,color:#fff,stroke:none
+    classDef external fill:#999999,color:#fff,stroke:none
+
+    class operator person
+    class fsm system
+    class cameras,microphones,alerting external
