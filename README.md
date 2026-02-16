@@ -1,5 +1,7 @@
 # Factory Safety Monitor
 
+[![CI](https://github.com/ssevera1/Edge-Native-Vision-Copilot/actions/workflows/ci.yml/badge.svg)](https://github.com/ssevera1/Edge-Native-Vision-Copilot/actions/workflows/ci.yml)
+
 Edge-native vision + acoustic fusion system that detects PPE violations on factory floors. Runs on resource-constrained hardware (≤2 GB RAM, ≤4 CPU cores) using inference-only runtimes — no heavy training frameworks on device.
 
 ## How It Works
