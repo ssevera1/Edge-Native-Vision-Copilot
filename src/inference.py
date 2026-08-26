@@ -35,6 +35,25 @@ logging.basicConfig(
 log = logging.getLogger("safety-monitor")
 
 # ------------------------------------------------------------------
+# Exceptions
+# ------------------------------------------------------------------
+
+class VideoIOError(Exception):
+    """Raised when video file I/O fails."""
+    pass
+
+
+class MissingFrameError(Exception):
+    """Raised when a frame cannot be read from video."""
+    pass
+
+
+class MalformedModelOutputError(Exception):
+    """Raised when model output is malformed or invalid."""
+    pass
+
+
+# ------------------------------------------------------------------
 # Data structures
 # ------------------------------------------------------------------
 
@@ -89,15 +108,43 @@ class HelmetDetector:
 
     # --- real inference path ------------------------------------------
     def _infer_onnx(self, frame: np.ndarray) -> DetectionResult:
-        blob = cv2.resize(frame, (224, 224)).astype(np.float32) / 255.0
-        blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]  # NCHW
-        outputs = self.session.run(None, {self.input_name: blob})
-        scores = outputs[0][0]
-        idx = int(np.argmax(scores))
-        return DetectionResult(
-            label=self.LABELS[idx],
-            confidence=float(scores[idx]),
-        )
+        try:
+            if frame is None or frame.size == 0:
+                raise MissingFrameError("Frame is None or empty")
+            
+            blob = cv2.resize(frame, (224, 224)).astype(np.float32) / 255.0
+            blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]  # NCHW
+            outputs = self.session.run(None, {self.input_name: blob})
+            
+            if not outputs or len(outputs) == 0:
+                raise MalformedModelOutputError("Model returned empty output")
+            
+            scores = outputs[0]
+            if scores.size == 0 or len(scores.shape) == 0:
+                raise MalformedModelOutputError("Model scores are malformed or empty")
+            
+            scores_array = scores[0] if len(scores.shape) > 1 else scores
+            if scores_array.size != len(self.LABELS):
+                raise MalformedModelOutputError(
+                    f"Expected {len(self.LABELS)} output scores, got {scores_array.size}"
+                )
+            
+            idx = int(np.argmax(scores_array))
+            confidence = float(scores_array[idx])
+            
+            if not (0.0 <= confidence <= 1.0):
+                raise MalformedModelOutputError(
+                    f"Confidence {confidence} out of valid range [0.0, 1.0]"
+                )
+            
+            return DetectionResult(
+                label=self.LABELS[idx],
+                confidence=confidence,
+            )
+        except (MissingFrameError, MalformedModelOutputError):
+            raise
+        except Exception as e:
+            raise MalformedModelOutputError(f"ONNX inference failed: {e}") from e
 
     # --- simulated path (no model file) -------------------------------
     @staticmethod
@@ -166,21 +213,36 @@ def frame_generator(video_path: str):
 
     If the file does not exist a synthetic 640x480 noise stream is
     generated so the pipeline can still run end-to-end on bare hardware.
+    
+    Raises
+    ------
+    VideoIOError
+        When the video file cannot be opened or read.
+    MissingFrameError
+        When a frame cannot be retrieved from the video stream.
     """
     path = Path(video_path)
     if path.exists():
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
-            log.error("Cannot open video file: %s", path)
-            return
+            raise VideoIOError(f"Cannot open video file: {path}")
+        
         idx = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            yield idx, frame
-            idx += 1
-        cap.release()
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    if idx == 0:
+                        raise MissingFrameError(f"Cannot read first frame from {path}")
+                    break
+                if frame is None or frame.size == 0:
+                    raise MissingFrameError(f"Frame {idx} from {path} is None or empty")
+                yield idx, frame
+                idx += 1
+        except (VideoIOError, MissingFrameError):
+            raise
+        finally:
+            cap.release()
         log.info("Finished reading %d frames from %s", idx, path)
     else:
         log.warning("Video file not found (%s) — generating synthetic frames", path)
@@ -203,31 +265,47 @@ def run_pipeline(
     fusion = SensorFusion(acoustic_threshold=acoustic_threshold)
 
     alert_count = 0
+    frames_processed = 0
 
-    for frame_idx, frame in frame_generator(video_path):
-        # Simulate an acoustic anomaly score arriving from a microphone sensor
-        acoustic_score = round(random.uniform(0.0, 1.0), 3)
+    try:
+        for frame_idx, frame in frame_generator(video_path):
+            try:
+                # Simulate an acoustic anomaly score arriving from a microphone sensor
+                acoustic_score = round(random.uniform(0.0, 1.0), 3)
 
-        detection = detector.detect(frame)
-        alert = fusion.evaluate(frame, detection, acoustic_score)
+                detection = detector.detect(frame)
+                alert = fusion.evaluate(frame, detection, acoustic_score)
 
-        if alert is not None:
-            alert.frame_index = frame_idx
-            alert_count += 1
-            log.warning("Frame %05d | %s", frame_idx, alert.message)
-        else:
-            log.info(
-                "Frame %05d | label=%-10s conf=%.2f  acoustic=%.2f  => OK",
-                frame_idx,
-                detection.label,
-                detection.confidence,
-                acoustic_score,
-            )
+                if alert is not None:
+                    alert.frame_index = frame_idx
+                    alert_count += 1
+                    log.warning("Frame %05d | %s", frame_idx, alert.message)
+                else:
+                    log.info(
+                        "Frame %05d | label=%-10s conf=%.2f  acoustic=%.2f  => OK",
+                        frame_idx,
+                        detection.label,
+                        detection.confidence,
+                        acoustic_score,
+                    )
+                
+                frames_processed += 1
+                # Throttle to approximate real-time playback on weak hardware
+                time.sleep(frame_interval)
+            
+            except (MissingFrameError, MalformedModelOutputError) as e:
+                log.error("Frame %05d | Processing failed: %s", frame_idx, e)
+                continue
+    
+    except VideoIOError as e:
+        log.error("Video I/O error: %s", e)
+        sys.exit(1)
 
-        # Throttle to approximate real-time playback on weak hardware
-        time.sleep(frame_interval)
-
-    log.info("Pipeline finished. Total alerts triggered: %d", alert_count)
+    log.info(
+        "Pipeline finished. Processed %d frames, %d alerts triggered",
+        frames_processed,
+        alert_count,
+    )
 
 
 # ------------------------------------------------------------------
