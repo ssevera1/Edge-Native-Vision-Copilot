@@ -35,6 +35,35 @@ logging.basicConfig(
 log = logging.getLogger("safety-monitor")
 
 # ------------------------------------------------------------------
+# Exceptions
+# ------------------------------------------------------------------
+
+class VideoIOError(Exception):
+    """Raised when video file I/O fails."""
+    pass
+
+
+class MissingFrameError(Exception):
+    """Raised when a frame cannot be read from video."""
+    pass
+
+
+class MalformedModelOutputError(Exception):
+    """Raised when model output is malformed or invalid."""
+    pass
+
+
+class PipelineError(Exception):
+    """Raised when the pipeline cannot complete a healthy run."""
+    pass
+
+
+# Abort the run when this many frames in a row fail to be processed: a
+# systematically broken model must not finish with a green exit code.
+MAX_CONSECUTIVE_FRAME_FAILURES = 10
+
+
+# ------------------------------------------------------------------
 # Data structures
 # ------------------------------------------------------------------
 
@@ -58,6 +87,25 @@ class AlertEvent:
 # ------------------------------------------------------------------
 # Helmet detector (ONNX or simulated)
 # ------------------------------------------------------------------
+
+def _as_probabilities(scores: np.ndarray) -> np.ndarray:
+    """Return ``scores`` as a probability distribution.
+
+    Models exported with a softmax head already emit probabilities and are
+    returned untouched, so their confidence value is preserved exactly.
+    Models exported with a raw-logit head emit arbitrary reals (routinely
+    negative) and are normalised with a softmax.
+    """
+    if (
+        np.all(scores >= 0.0)
+        and np.all(scores <= 1.0)
+        and bool(np.isclose(scores.sum(), 1.0, atol=1e-3))
+    ):
+        return scores
+    shifted = scores - np.max(scores)
+    exp = np.exp(shifted)
+    return exp / exp.sum()
+
 
 class HelmetDetector:
     """Wraps an ONNX helmet-detection model.
@@ -89,14 +137,35 @@ class HelmetDetector:
 
     # --- real inference path ------------------------------------------
     def _infer_onnx(self, frame: np.ndarray) -> DetectionResult:
+        if frame is None or frame.size == 0:
+            raise MissingFrameError("Frame is None or empty")
+
         blob = cv2.resize(frame, (224, 224)).astype(np.float32) / 255.0
         blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]  # NCHW
+
+        # Anything the runtime itself raises (shape mismatch, OOM, a broken
+        # graph) is a real failure, not a malformed *output* — let it
+        # propagate so the run dies loudly instead of being skipped per-frame.
         outputs = self.session.run(None, {self.input_name: blob})
-        scores = outputs[0][0]
-        idx = int(np.argmax(scores))
+
+        if not outputs:
+            raise MalformedModelOutputError("Model returned empty output")
+
+        scores = np.asarray(outputs[0]).reshape(-1)
+        if scores.size != len(self.LABELS):
+            raise MalformedModelOutputError(
+                f"Expected {len(self.LABELS)} output scores, got {scores.size}"
+            )
+        if not np.all(np.isfinite(scores)):
+            raise MalformedModelOutputError(
+                f"Model scores contain NaN/Inf: {scores.tolist()}"
+            )
+
+        probs = _as_probabilities(scores)
+        idx = int(np.argmax(probs))
         return DetectionResult(
             label=self.LABELS[idx],
-            confidence=float(scores[idx]),
+            confidence=float(probs[idx]),
         )
 
     # --- simulated path (no model file) -------------------------------
@@ -166,21 +235,36 @@ def frame_generator(video_path: str):
 
     If the file does not exist a synthetic 640x480 noise stream is
     generated so the pipeline can still run end-to-end on bare hardware.
+    A file that *does* exist but cannot be decoded is an error, not a
+    reason to degrade (see ADR-004).
+
+    Raises
+    ------
+    VideoIOError
+        When the video file cannot be opened or read.
+    MissingFrameError
+        When a frame cannot be retrieved from the video stream.
     """
     path = Path(video_path)
     if path.exists():
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
-            log.error("Cannot open video file: %s", path)
-            return
+            raise VideoIOError(f"Cannot open video file: {path}")
+
         idx = 0
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            yield idx, frame
-            idx += 1
-        cap.release()
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    if idx == 0:
+                        raise MissingFrameError(f"Cannot read first frame from {path}")
+                    break
+                if frame is None or frame.size == 0:
+                    raise MissingFrameError(f"Frame {idx} from {path} is None or empty")
+                yield idx, frame
+                idx += 1
+        finally:
+            cap.release()
         log.info("Finished reading %d frames from %s", idx, path)
     else:
         log.warning("Video file not found (%s) — generating synthetic frames", path)
@@ -198,36 +282,78 @@ def run_pipeline(
     model_path: Optional[str] = None,
     acoustic_threshold: float = 0.8,
     frame_interval: float = 0.033,
-):
+) -> tuple[int, int]:
+    """Run the end-to-end pipeline and return ``(frames_processed, alerts)``.
+
+    Raises
+    ------
+    VideoIOError, MissingFrameError
+        Propagated from :func:`frame_generator`; the stream is unusable and
+        the generator is closed, so the run cannot continue.
+    PipelineError
+        When too many consecutive frames fail, or when frames were read but
+        none could be processed. Both are silent-success modes for a safety
+        monitor, so they must abort the run.
+    """
     detector = HelmetDetector(model_path)
     fusion = SensorFusion(acoustic_threshold=acoustic_threshold)
 
     alert_count = 0
+    frames_seen = 0
+    frames_processed = 0
+    consecutive_failures = 0
 
     for frame_idx, frame in frame_generator(video_path):
-        # Simulate an acoustic anomaly score arriving from a microphone sensor
-        acoustic_score = round(random.uniform(0.0, 1.0), 3)
+        frames_seen += 1
+        try:
+            # Simulate an acoustic anomaly score arriving from a microphone sensor
+            acoustic_score = round(random.uniform(0.0, 1.0), 3)
 
-        detection = detector.detect(frame)
-        alert = fusion.evaluate(frame, detection, acoustic_score)
+            detection = detector.detect(frame)
+            alert = fusion.evaluate(frame, detection, acoustic_score)
 
-        if alert is not None:
-            alert.frame_index = frame_idx
-            alert_count += 1
-            log.warning("Frame %05d | %s", frame_idx, alert.message)
-        else:
-            log.info(
-                "Frame %05d | label=%-10s conf=%.2f  acoustic=%.2f  => OK",
-                frame_idx,
-                detection.label,
-                detection.confidence,
-                acoustic_score,
-            )
+            if alert is not None:
+                alert.frame_index = frame_idx
+                alert_count += 1
+                log.warning("Frame %05d | %s", frame_idx, alert.message)
+            else:
+                log.info(
+                    "Frame %05d | label=%-10s conf=%.2f  acoustic=%.2f  => OK",
+                    frame_idx,
+                    detection.label,
+                    detection.confidence,
+                    acoustic_score,
+                )
 
-        # Throttle to approximate real-time playback on weak hardware
-        time.sleep(frame_interval)
+            frames_processed += 1
+            consecutive_failures = 0
+            # Throttle to approximate real-time playback on weak hardware
+            time.sleep(frame_interval)
 
-    log.info("Pipeline finished. Total alerts triggered: %d", alert_count)
+        except (MissingFrameError, MalformedModelOutputError) as e:
+            consecutive_failures += 1
+            log.error("Frame %05d | Processing failed: %s", frame_idx, e)
+            if consecutive_failures >= MAX_CONSECUTIVE_FRAME_FAILURES:
+                raise PipelineError(
+                    f"Aborting: {consecutive_failures} consecutive frames failed "
+                    f"(last error at frame {frame_idx}: {e})"
+                ) from e
+            continue
+
+    log.info(
+        "Pipeline finished. Processed %d/%d frames, %d alerts triggered",
+        frames_processed,
+        frames_seen,
+        alert_count,
+    )
+
+    if frames_seen and not frames_processed:
+        raise PipelineError(
+            f"Read {frames_seen} frame(s) but processed none — refusing to "
+            f"report a successful run"
+        )
+
+    return frames_processed, alert_count
 
 
 # ------------------------------------------------------------------
@@ -262,12 +388,16 @@ def main():
     )
     args = parser.parse_args()
 
-    run_pipeline(
-        video_path=args.video,
-        model_path=args.model,
-        acoustic_threshold=args.acoustic_threshold,
-        frame_interval=args.frame_interval,
-    )
+    try:
+        run_pipeline(
+            video_path=args.video,
+            model_path=args.model,
+            acoustic_threshold=args.acoustic_threshold,
+            frame_interval=args.frame_interval,
+        )
+    except (VideoIOError, MissingFrameError, PipelineError) as e:
+        log.error("Pipeline aborted: %s", e)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

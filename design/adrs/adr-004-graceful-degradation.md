@@ -1,6 +1,6 @@
 # ADR-004: Graceful degradation at every pipeline stage
 
-**Status:** Accepted
+**Status:** Accepted (amended 2026-08-26 — see *Amendment: absent vs. broken*)
 **Date:** 2026-02-16
 **Deciders:** Edge AI Engineering Team
 
@@ -50,4 +50,31 @@ system to start and run end-to-end, even with missing external resources:
   `ort is not None` before creating a session.
 - `frame_generator()` checks `Path(video_path).exists()` before opening
   a capture.
-- No component raises an exception for missing external resources at startup.
+- No component raises an exception for an **absent** external resource at
+  startup. Resources that are present but unusable are covered by the
+  amendment below.
+
+## Amendment: absent vs. broken (2026-08-26)
+
+The original decision conflated two different situations. Degrading on an
+*absent* resource is a bootstrap aid; degrading on a *present but broken*
+resource hides a fault in the very signal the monitor exists to produce.
+The fallback rule is therefore narrowed to absence only:
+
+| Situation | Behaviour |
+|---|---|
+| Video file does not exist | Synthetic frames (unchanged) |
+| No `.onnx` model / no `onnxruntime` | Simulated detections (unchanged) |
+| Video file exists but cannot be opened | `VideoIOError` — abort, exit 1 |
+| Frame cannot be decoded from the stream | `MissingFrameError` — abort, exit 1 |
+| Model output has the wrong shape / NaN | `MalformedModelOutputError` — frame skipped |
+| Runtime fault inside the ORT session | Propagates unchanged — abort |
+| ≥ `MAX_CONSECUTIVE_FRAME_FAILURES` failures in a row, or frames read but none processed | `PipelineError` — abort, exit 1 |
+
+Isolated frame-level failures are still skipped, because one bad frame in a
+long stream is not a reason to take the monitor offline. What is no longer
+permitted is finishing with exit code 0 after processing nothing — the
+silent-success mode this amendment exists to remove.
+
+`run_pipeline()` raises rather than calling `sys.exit()`, so it stays usable
+as a library and test entry point; `main()` maps those exceptions to exit 1.
