@@ -212,6 +212,16 @@ class SensorFusion:
         visual_violation = detection.label == "no_helmet"
         acoustic_violation = acoustic_score > self.acoustic_threshold
 
+        log.debug(
+            "Fusion decision: visual_violation=%s (label=%s), "
+            "acoustic_violation=%s (score=%.3f > threshold=%.3f)",
+            visual_violation,
+            detection.label,
+            acoustic_violation,
+            acoustic_score,
+            self.acoustic_threshold,
+        )
+
         if visual_violation and acoustic_violation:
             return AlertEvent(
                 frame_index=-1,  # caller fills this in
