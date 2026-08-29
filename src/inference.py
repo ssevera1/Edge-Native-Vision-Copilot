@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
+import numbers
 import random
 import sys
 import time
@@ -206,17 +208,27 @@ class SensorFusion:
         Raises
         ------
         InvalidAcousticScoreError
-            When the score is None, NaN, Inf, or outside [0.0, 1.0].
+            When the score is None, non-numeric, boolean, NaN, Inf, or
+            outside [0.0, 1.0].
         """
         if acoustic_score is None:
             raise InvalidAcousticScoreError(
                 "Acoustic score is None; cannot proceed with fusion decision"
             )
-        if not isinstance(acoustic_score, (int, float)):
+        # ``numbers.Real`` rather than ``(int, float)``: numpy scalars are the
+        # native currency of this module and float32 is the usual dtype of an
+        # acoustic model's output, but np.float32 is not a subclass of float
+        # (only np.float64 is). ``bool`` is excluded explicitly because it *is*
+        # a subclass of int, so a sensor-fault flag leaking into the score
+        # channel would otherwise fuse as 1.0 — a maximum-severity alert.
+        if isinstance(acoustic_score, bool) or not isinstance(acoustic_score, numbers.Real):
             raise InvalidAcousticScoreError(
                 f"Acoustic score must be numeric, got {type(acoustic_score).__name__}"
             )
-        if not np.isfinite(acoustic_score):
+        # math.isfinite, not np.isfinite: the latter raises TypeError on Real
+        # types it has no ufunc loop for (e.g. Fraction), which would escape
+        # this validator instead of surfacing as InvalidAcousticScoreError.
+        if not math.isfinite(acoustic_score):
             raise InvalidAcousticScoreError(
                 f"Acoustic score is NaN or Inf: {acoustic_score}"
             )
@@ -242,7 +254,8 @@ class SensorFusion:
         Raises
         ------
         InvalidAcousticScoreError
-            When acoustic_score is None, NaN, Inf, or out of range.
+            When acoustic_score is None, non-numeric, boolean, NaN, Inf, or
+            out of range.
         """
         self._validate_acoustic_score(acoustic_score)
 
