@@ -12,10 +12,13 @@ import pytest
 
 from src import inference
 from src.inference import (
+    DetectionResult,
     HelmetDetector,
+    InvalidAcousticScoreError,
     MalformedModelOutputError,
     MissingFrameError,
     PipelineError,
+    SensorFusion,
     VideoIOError,
     frame_generator,
     main,
@@ -120,6 +123,81 @@ class TestModelOutputValidation:
         detector = _detector_with(_FakeSession(exc=RuntimeError("input shape mismatch")))
         with pytest.raises(RuntimeError, match="input shape mismatch"):
             detector.detect(FRAME)
+
+
+# ------------------------------------------------------------------
+# Acoustic score validation
+# ------------------------------------------------------------------
+
+def _det(label: str = "no_helmet", confidence: float = 0.9) -> DetectionResult:
+    return DetectionResult(label=label, confidence=confidence)
+
+
+class TestAcousticScoreValidation:
+    """A malfunctioning microphone must fail loudly, never fuse on garbage."""
+
+    @pytest.fixture
+    def fusion(self) -> SensorFusion:
+        return SensorFusion()
+
+    def test_none_score_is_rejected(self, fusion: SensorFusion):
+        with pytest.raises(InvalidAcousticScoreError, match="None"):
+            fusion.evaluate(FRAME, _det(), None)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("score", ["0.95", [0.95], {"score": 0.95}, object()])
+    def test_non_numeric_score_is_rejected(self, fusion: SensorFusion, score):
+        with pytest.raises(InvalidAcousticScoreError, match="must be numeric"):
+            fusion.evaluate(FRAME, _det(), score)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("score", [float("nan"), np.float32("nan")])
+    def test_nan_score_is_rejected(self, fusion: SensorFusion, score):
+        with pytest.raises(InvalidAcousticScoreError, match="NaN or Inf"):
+            fusion.evaluate(FRAME, _det(), score)
+
+    @pytest.mark.parametrize("score", [float("inf"), float("-inf")])
+    def test_inf_score_is_rejected(self, fusion: SensorFusion, score):
+        with pytest.raises(InvalidAcousticScoreError, match="NaN or Inf"):
+            fusion.evaluate(FRAME, _det(), score)
+
+    @pytest.mark.parametrize("score", [-0.1, 1.1, -1.0, 42.0])
+    def test_out_of_range_score_is_rejected(self, fusion: SensorFusion, score):
+        with pytest.raises(InvalidAcousticScoreError, match="out of valid range"):
+            fusion.evaluate(FRAME, _det(), score)
+
+    @pytest.mark.parametrize("score", [True, False])
+    def test_bool_score_is_rejected(self, fusion: SensorFusion, score):
+        """`bool` subclasses `int`: a fault flag must not fuse as a 1.0 score."""
+        with pytest.raises(InvalidAcousticScoreError, match="must be numeric"):
+            fusion.evaluate(FRAME, _det(), score)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "score",
+        [np.float32(0.95), np.float64(0.95), np.float16(0.95)],
+    )
+    def test_numpy_scalar_scores_are_accepted(self, fusion: SensorFusion, score):
+        """np.float32/16 are not subclasses of `float` but are valid scores."""
+        assert fusion.evaluate(FRAME, _det(), score) is not None
+
+    @pytest.mark.parametrize("score", [np.float32(0.5), 0])
+    def test_valid_low_scores_do_not_alert(self, fusion: SensorFusion, score):
+        assert fusion.evaluate(FRAME, _det(), score) is None
+
+    def test_boundary_values_stay_inclusive(self, fusion: SensorFusion):
+        """0.0 and 1.0 are in range — the bounds must remain `<=`."""
+        assert fusion.evaluate(FRAME, _det(), 0.0) is None
+        assert fusion.evaluate(FRAME, _det(), 1.0) is not None
+
+    def test_bad_score_aborts_the_run_after_consecutive_failures(self, monkeypatch):
+        """A stuck bad sensor must trip the consecutive-failure abort."""
+        monkeypatch.setattr(inference, "frame_generator", _stream(*[FRAME] * 500))
+        monkeypatch.setattr(
+            HelmetDetector,
+            "detect",
+            lambda self, frame: DetectionResult(label="helmet", confidence=0.9),
+        )
+        monkeypatch.setattr(inference.random, "uniform", lambda _a, _b: float("nan"))
+        with pytest.raises(PipelineError):
+            run_pipeline("whatever.mp4", frame_interval=0.0)
 
 
 # ------------------------------------------------------------------
