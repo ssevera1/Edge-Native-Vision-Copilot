@@ -53,6 +53,11 @@ class MalformedModelOutputError(Exception):
     pass
 
 
+class InvalidAcousticScoreError(Exception):
+    """Raised when acoustic anomaly score is invalid."""
+    pass
+
+
 class PipelineError(Exception):
     """Raised when the pipeline cannot complete a healthy run."""
     pass
@@ -195,6 +200,31 @@ class SensorFusion:
     def __init__(self, acoustic_threshold: float = 0.8):
         self.acoustic_threshold = acoustic_threshold
 
+    def _validate_acoustic_score(self, acoustic_score: float) -> None:
+        """Validate acoustic anomaly score.
+
+        Raises
+        ------
+        InvalidAcousticScoreError
+            When the score is None, NaN, Inf, or outside [0.0, 1.0].
+        """
+        if acoustic_score is None:
+            raise InvalidAcousticScoreError(
+                "Acoustic score is None; cannot proceed with fusion decision"
+            )
+        if not isinstance(acoustic_score, (int, float)):
+            raise InvalidAcousticScoreError(
+                f"Acoustic score must be numeric, got {type(acoustic_score).__name__}"
+            )
+        if not np.isfinite(acoustic_score):
+            raise InvalidAcousticScoreError(
+                f"Acoustic score is NaN or Inf: {acoustic_score}"
+            )
+        if not (0.0 <= acoustic_score <= 1.0):
+            raise InvalidAcousticScoreError(
+                f"Acoustic score {acoustic_score} is out of valid range [0.0, 1.0]"
+            )
+
     def evaluate(
         self,
         frame: np.ndarray,
@@ -208,7 +238,14 @@ class SensorFusion:
         Trigger when **both** conditions hold:
           1. The visual model detects ``no_helmet``.
           2. The acoustic anomaly score exceeds ``acoustic_threshold``.
+
+        Raises
+        ------
+        InvalidAcousticScoreError
+            When acoustic_score is None, NaN, Inf, or out of range.
         """
+        self._validate_acoustic_score(acoustic_score)
+
         visual_violation = detection.label == "no_helmet"
         acoustic_violation = acoustic_score > self.acoustic_threshold
 
@@ -340,7 +377,7 @@ def run_pipeline(
             # Throttle to approximate real-time playback on weak hardware
             time.sleep(frame_interval)
 
-        except (MissingFrameError, MalformedModelOutputError) as e:
+        except (MissingFrameError, MalformedModelOutputError, InvalidAcousticScoreError) as e:
             consecutive_failures += 1
             log.error("Frame %05d | Processing failed: %s", frame_idx, e)
             if consecutive_failures >= MAX_CONSECUTIVE_FRAME_FAILURES:
