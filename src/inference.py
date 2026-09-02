@@ -69,6 +69,12 @@ class PipelineError(Exception):
 # systematically broken model must not finish with a green exit code.
 MAX_CONSECUTIVE_FRAME_FAILURES = 10
 
+# Retry configuration for video file open operation
+VIDEO_OPEN_MAX_RETRIES = 3
+VIDEO_OPEN_INITIAL_DELAY = 0.1  # seconds
+VIDEO_OPEN_BACKOFF_FACTOR = 2.0
+VIDEO_OPEN_TIMEOUT = 5.0  # seconds
+
 
 # ------------------------------------------------------------------
 # Data structures
@@ -307,9 +313,37 @@ def frame_generator(video_path: str):
     """
     path = Path(video_path)
     if path.exists():
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            raise VideoIOError(f"Cannot open video file: {path}")
+        cap = None
+        last_error = None
+        elapsed = 0.0
+        delay = VIDEO_OPEN_INITIAL_DELAY
+        start_time = time.time()
+
+        while elapsed < VIDEO_OPEN_TIMEOUT and cap is None:
+            try:
+                cap = cv2.VideoCapture(str(path))
+                if not cap.isOpened():
+                    cap = None
+                    raise VideoIOError(f"VideoCapture failed to open: {path}")
+            except Exception as e:
+                last_error = e
+                elapsed = time.time() - start_time
+                if elapsed < VIDEO_OPEN_TIMEOUT:
+                    attempt_num = int(elapsed / delay) + 1
+                    log.warning(
+                        "Failed to open video (attempt %d): %s; retrying in %.2f s",
+                        attempt_num,
+                        e,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * VIDEO_OPEN_BACKOFF_FACTOR, VIDEO_OPEN_TIMEOUT)
+
+        if cap is None:
+            raise VideoIOError(
+                f"Cannot open video file after {VIDEO_OPEN_MAX_RETRIES} retries "
+                f"over {VIDEO_OPEN_TIMEOUT}s: {path} (last error: {last_error})"
+            )
 
         idx = 0
         try:
