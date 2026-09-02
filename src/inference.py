@@ -315,29 +315,35 @@ def frame_generator(video_path: str):
     if path.exists():
         cap = None
         last_error = None
-        elapsed = 0.0
         delay = VIDEO_OPEN_INITIAL_DELAY
         start_time = time.time()
 
-        while elapsed < VIDEO_OPEN_TIMEOUT and cap is None:
+        for attempt_num in range(1, VIDEO_OPEN_MAX_RETRIES + 1):
             try:
                 cap = cv2.VideoCapture(str(path))
                 if not cap.isOpened():
+                    cap.release()
                     cap = None
                     raise VideoIOError(f"VideoCapture failed to open: {path}")
             except Exception as e:
                 last_error = e
                 elapsed = time.time() - start_time
-                if elapsed < VIDEO_OPEN_TIMEOUT:
-                    attempt_num = int(elapsed / delay) + 1
+                remaining = VIDEO_OPEN_TIMEOUT - elapsed
+                if attempt_num < VIDEO_OPEN_MAX_RETRIES and remaining > 0:
+                    sleep_for = min(delay, remaining)
                     log.warning(
-                        "Failed to open video (attempt %d): %s; retrying in %.2f s",
+                        "Failed to open video (attempt %d/%d): %s; retrying in %.2f s",
                         attempt_num,
+                        VIDEO_OPEN_MAX_RETRIES,
                         e,
-                        delay,
+                        sleep_for,
                     )
-                    time.sleep(delay)
-                    delay = min(delay * VIDEO_OPEN_BACKOFF_FACTOR, VIDEO_OPEN_TIMEOUT)
+                    time.sleep(sleep_for)
+                    delay *= VIDEO_OPEN_BACKOFF_FACTOR
+                else:
+                    break
+            else:
+                break
 
         if cap is None:
             raise VideoIOError(
