@@ -69,6 +69,12 @@ class PipelineError(Exception):
 # systematically broken model must not finish with a green exit code.
 MAX_CONSECUTIVE_FRAME_FAILURES = 10
 
+# Retry configuration for video file open operation
+VIDEO_OPEN_MAX_RETRIES = 3
+VIDEO_OPEN_INITIAL_DELAY = 0.1  # seconds
+VIDEO_OPEN_BACKOFF_FACTOR = 2.0
+VIDEO_OPEN_TIMEOUT = 5.0  # seconds
+
 
 # ------------------------------------------------------------------
 # Data structures
@@ -307,9 +313,43 @@ def frame_generator(video_path: str):
     """
     path = Path(video_path)
     if path.exists():
-        cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            raise VideoIOError(f"Cannot open video file: {path}")
+        cap = None
+        last_error = None
+        delay = VIDEO_OPEN_INITIAL_DELAY
+        start_time = time.time()
+
+        for attempt_num in range(1, VIDEO_OPEN_MAX_RETRIES + 1):
+            try:
+                cap = cv2.VideoCapture(str(path))
+                if not cap.isOpened():
+                    cap.release()
+                    cap = None
+                    raise VideoIOError(f"VideoCapture failed to open: {path}")
+            except Exception as e:
+                last_error = e
+                elapsed = time.time() - start_time
+                remaining = VIDEO_OPEN_TIMEOUT - elapsed
+                if attempt_num < VIDEO_OPEN_MAX_RETRIES and remaining > 0:
+                    sleep_for = min(delay, remaining)
+                    log.warning(
+                        "Failed to open video (attempt %d/%d): %s; retrying in %.2f s",
+                        attempt_num,
+                        VIDEO_OPEN_MAX_RETRIES,
+                        e,
+                        sleep_for,
+                    )
+                    time.sleep(sleep_for)
+                    delay *= VIDEO_OPEN_BACKOFF_FACTOR
+                else:
+                    break
+            else:
+                break
+
+        if cap is None:
+            raise VideoIOError(
+                f"Cannot open video file after {VIDEO_OPEN_MAX_RETRIES} retries "
+                f"over {VIDEO_OPEN_TIMEOUT}s: {path} (last error: {last_error})"
+            )
 
         idx = 0
         try:

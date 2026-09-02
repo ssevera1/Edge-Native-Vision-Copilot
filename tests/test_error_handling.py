@@ -313,3 +313,40 @@ class TestFrameGenerator:
         assert idx == 0
         assert frame.shape == (480, 640, 3)
         gen.close()
+
+    def test_open_retry_is_bounded_and_releases_handles(self, tmp_path, monkeypatch):
+        """A permanently-undecodable file must retry at most
+        VIDEO_OPEN_MAX_RETRIES times, releasing every failed capture handle,
+        and the whole attempt must finish well inside VIDEO_OPEN_TIMEOUT.
+        """
+        bad = tmp_path / "corrupt.mp4"
+        bad.write_bytes(b"not a video")
+
+        class _FakeCap:
+            def __init__(self):
+                self.released = False
+
+            def isOpened(self):
+                return False
+
+            def release(self):
+                self.released = True
+
+        opened_caps = []
+
+        def _fake_video_capture(_path):
+            cap = _FakeCap()
+            opened_caps.append(cap)
+            return cap
+
+        monkeypatch.setattr(inference.cv2, "VideoCapture", _fake_video_capture)
+
+        start = inference.time.time()
+        with pytest.raises(VideoIOError) as exc_info:
+            list(frame_generator(str(bad)))
+        elapsed = inference.time.time() - start
+
+        assert len(opened_caps) == inference.VIDEO_OPEN_MAX_RETRIES
+        assert all(cap.released for cap in opened_caps)
+        assert elapsed < inference.VIDEO_OPEN_TIMEOUT
+        assert str(inference.VIDEO_OPEN_MAX_RETRIES) in str(exc_info.value)
