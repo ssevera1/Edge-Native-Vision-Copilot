@@ -75,6 +75,11 @@ VIDEO_OPEN_INITIAL_DELAY = 0.1  # seconds
 VIDEO_OPEN_BACKOFF_FACTOR = 2.0
 VIDEO_OPEN_TIMEOUT = 5.0  # seconds
 
+# Retry configuration for frame reading
+FRAME_READ_MAX_RETRIES = 3
+FRAME_READ_INITIAL_DELAY = 0.01  # seconds
+FRAME_READ_BACKOFF_FACTOR = 2.0
+
 
 # ------------------------------------------------------------------
 # Data structures
@@ -354,14 +359,40 @@ def frame_generator(video_path: str):
         idx = 0
         try:
             while True:
-                ok, frame = cap.read()
+                frame = None
+                delay = FRAME_READ_INITIAL_DELAY
+                last_frame_error = None
+
+                for attempt_num in range(1, FRAME_READ_MAX_RETRIES + 1):
+                    try:
+                        ok, frame = cap.read()
+                        if not ok:
+                            if idx == 0:
+                                raise MissingFrameError(f"Cannot read first frame from {path}")
+                            break
+                        if frame is None or frame.size == 0:
+                            raise MissingFrameError(f"Frame {idx} from {path} is None or empty")
+                        break
+                    except Exception as e:
+                        last_frame_error = e
+                        if attempt_num < FRAME_READ_MAX_RETRIES:
+                            log.debug(
+                                "Failed to read frame %d (attempt %d/%d): %s; retrying in %.3f s",
+                                idx,
+                                attempt_num,
+                                FRAME_READ_MAX_RETRIES,
+                                e,
+                                delay,
+                            )
+                            time.sleep(delay)
+                            delay *= FRAME_READ_BACKOFF_FACTOR
+                        else:
+                            raise
+
                 if not ok:
-                    if idx == 0:
-                        raise MissingFrameError(f"Cannot read first frame from {path}")
                     break
-                if frame is None or frame.size == 0:
-                    raise MissingFrameError(f"Frame {idx} from {path} is None or empty")
-                yield idx, frame
+                if frame is not None and frame.size > 0:
+                    yield idx, frame
                 idx += 1
         finally:
             cap.release()
