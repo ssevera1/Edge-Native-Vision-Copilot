@@ -361,7 +361,6 @@ def frame_generator(video_path: str):
             while True:
                 frame = None
                 delay = FRAME_READ_INITIAL_DELAY
-                last_frame_error = None
 
                 for attempt_num in range(1, FRAME_READ_MAX_RETRIES + 1):
                     try:
@@ -374,9 +373,8 @@ def frame_generator(video_path: str):
                             raise MissingFrameError(f"Frame {idx} from {path} is None or empty")
                         break
                     except Exception as e:
-                        last_frame_error = e
                         if attempt_num < FRAME_READ_MAX_RETRIES:
-                            log.debug(
+                            log.warning(
                                 "Failed to read frame %d (attempt %d/%d): %s; retrying in %.3f s",
                                 idx,
                                 attempt_num,
@@ -386,13 +384,16 @@ def frame_generator(video_path: str):
                             )
                             time.sleep(delay)
                             delay *= FRAME_READ_BACKOFF_FACTOR
+                            # cap.read() advances the decoder even on failure;
+                            # seek back so the retry re-reads this frame instead
+                            # of silently consuming the next one.
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
                         else:
                             raise
 
                 if not ok:
                     break
-                if frame is not None and frame.size > 0:
-                    yield idx, frame
+                yield idx, frame
                 idx += 1
         finally:
             cap.release()

@@ -350,3 +350,54 @@ class TestFrameGenerator:
         assert all(cap.released for cap in opened_caps)
         assert elapsed < inference.VIDEO_OPEN_TIMEOUT
         assert str(inference.VIDEO_OPEN_MAX_RETRIES) in str(exc_info.value)
+
+    def test_frame_read_retry_reseeks_instead_of_skipping(self, tmp_path, monkeypatch):
+        """A transient read failure must retry the SAME frame index, not
+        silently advance to the next one. Without a re-seek, `idx` stays a
+        local counter while `cap.read()` has already moved on, so every
+        later frame gets yielded under the wrong index — exactly what
+        `alert.frame_index` must never do for a safety monitor.
+        """
+        good = tmp_path / "video.mp4"
+        good.write_bytes(b"not a real video, VideoCapture is faked below")
+
+        frames = [np.full((2, 2, 3), i, dtype=np.uint8) for i in range(3)]
+
+        class _FlakyCap:
+            def __init__(self):
+                self.pos = 0
+                self.set_calls = []
+                self._glitched_once = False
+
+            def isOpened(self):
+                return True
+
+            def read(self):
+                pos = self.pos
+                if pos == 1 and not self._glitched_once:
+                    # grab() succeeds (advancing the decoder) but retrieve()
+                    # hands back a bad frame, like a codec decode hiccup.
+                    self._glitched_once = True
+                    self.pos += 1
+                    return True, None
+                if pos >= len(frames):
+                    return False, None
+                self.pos += 1
+                return True, frames[pos]
+
+            def set(self, prop, value):
+                self.set_calls.append((prop, value))
+                self.pos = int(value)
+
+            def release(self):
+                pass
+
+        cap = _FlakyCap()
+        monkeypatch.setattr(inference.cv2, "VideoCapture", lambda _path: cap)
+        monkeypatch.setattr(inference.time, "sleep", lambda _seconds: None)
+
+        results = list(frame_generator(str(good)))
+
+        assert [idx for idx, _ in results] == [0, 1, 2]
+        assert np.array_equal(results[1][1], frames[1])
+        assert cap.set_calls == [(inference.cv2.CAP_PROP_POS_FRAMES, 1)]
