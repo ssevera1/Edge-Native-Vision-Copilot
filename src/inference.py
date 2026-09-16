@@ -65,6 +65,11 @@ class PipelineError(Exception):
     pass
 
 
+class ModelLoadError(Exception):
+    """Raised when ONNX model cannot be loaded."""
+    pass
+
+
 # Abort the run when this many frames in a row fail to be processed: a
 # systematically broken model must not finish with a green exit code.
 MAX_CONSECUTIVE_FRAME_FAILURES = 10
@@ -74,6 +79,12 @@ VIDEO_OPEN_MAX_RETRIES = 3
 VIDEO_OPEN_INITIAL_DELAY = 0.1  # seconds
 VIDEO_OPEN_BACKOFF_FACTOR = 2.0
 VIDEO_OPEN_TIMEOUT = 5.0  # seconds
+
+# Retry configuration for ONNX model loading
+MODEL_LOAD_MAX_RETRIES = 3
+MODEL_LOAD_INITIAL_DELAY = 0.5  # seconds
+MODEL_LOAD_BACKOFF_FACTOR = 2.0
+MODEL_LOAD_TIMEOUT = 10.0  # seconds
 
 
 # ------------------------------------------------------------------
@@ -131,16 +142,68 @@ class HelmetDetector:
 
     def __init__(self, model_path: Optional[str] = None):
         self.session: Optional["ort.InferenceSession"] = None
-        if model_path and Path(model_path).exists() and ort is not None:
-            log.info("Loading ONNX model from %s", model_path)
-            so = ort.SessionOptions()
-            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            so.intra_op_num_threads = 2        # keep CPU usage low on edge
-            so.inter_op_num_threads = 1
-            self.session = ort.InferenceSession(model_path, sess_options=so)
-            self.input_name = self.session.get_inputs()[0].name
+        if model_path and ort is not None:
+            self._load_model_with_retry(model_path)
         else:
-            log.warning("No ONNX model found — using simulated detections")
+            if model_path:
+                log.warning("ONNX runtime not available — using simulated detections")
+            else:
+                log.warning("No model path provided — using simulated detections")
+
+    def _load_model_with_retry(self, model_path: str) -> None:
+        """Load ONNX model with retry logic and validation.
+        
+        Raises
+        ------
+        ModelLoadError
+            When the model cannot be loaded after all retries or file is invalid.
+        """
+        path = Path(model_path)
+        if not path.exists():
+            log.warning("Model file not found at %s — using simulated detections", model_path)
+            return
+
+        if not path.is_file():
+            raise ModelLoadError(f"Model path is not a file: {model_path}")
+
+        last_error = None
+        delay = MODEL_LOAD_INITIAL_DELAY
+        start_time = time.time()
+
+        for attempt_num in range(1, MODEL_LOAD_MAX_RETRIES + 1):
+            try:
+                log.info("Loading ONNX model from %s (attempt %d/%d)",
+                         model_path, attempt_num, MODEL_LOAD_MAX_RETRIES)
+                so = ort.SessionOptions()
+                so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                so.intra_op_num_threads = 2        # keep CPU usage low on edge
+                so.inter_op_num_threads = 1
+                self.session = ort.InferenceSession(model_path, sess_options=so)
+                self.input_name = self.session.get_inputs()[0].name
+                log.info("Successfully loaded ONNX model")
+                return
+            except Exception as e:
+                last_error = e
+                elapsed = time.time() - start_time
+                remaining = MODEL_LOAD_TIMEOUT - elapsed
+                if attempt_num < MODEL_LOAD_MAX_RETRIES and remaining > 0:
+                    sleep_for = min(delay, remaining)
+                    log.warning(
+                        "Failed to load model (attempt %d/%d): %s; retrying in %.2f s",
+                        attempt_num,
+                        MODEL_LOAD_MAX_RETRIES,
+                        e,
+                        sleep_for,
+                    )
+                    time.sleep(sleep_for)
+                    delay *= MODEL_LOAD_BACKOFF_FACTOR
+                else:
+                    break
+
+        raise ModelLoadError(
+            f"Cannot load model after {MODEL_LOAD_MAX_RETRIES} retries "
+            f"over {MODEL_LOAD_TIMEOUT}s: {model_path} (last error: {last_error})"
+        )
 
     def detect(self, frame: np.ndarray) -> DetectionResult:
         """Run helmet detection on a single BGR frame."""
@@ -390,12 +453,19 @@ def run_pipeline(
     VideoIOError, MissingFrameError
         Propagated from :func:`frame_generator`; the stream is unusable and
         the generator is closed, so the run cannot continue.
+    ModelLoadError
+        When the ONNX model cannot be loaded after retries.
     PipelineError
         When too many consecutive frames fail, or when frames were read but
         none could be processed. Both are silent-success modes for a safety
         monitor, so they must abort the run.
     """
-    detector = HelmetDetector(model_path)
+    try:
+        detector = HelmetDetector(model_path)
+    except ModelLoadError as e:
+        log.error("Model loading failed: %s", e)
+        raise
+
     fusion = SensorFusion(acoustic_threshold=acoustic_threshold)
 
     alert_count = 0
@@ -495,7 +565,7 @@ def main():
             acoustic_threshold=args.acoustic_threshold,
             frame_interval=args.frame_interval,
         )
-    except (VideoIOError, MissingFrameError, PipelineError) as e:
+    except (VideoIOError, MissingFrameError, ModelLoadError, PipelineError) as e:
         log.error("Pipeline aborted: %s", e)
         sys.exit(1)
 
