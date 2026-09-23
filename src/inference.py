@@ -60,6 +60,11 @@ class InvalidAcousticScoreError(Exception):
     pass
 
 
+class FramePreprocessingError(Exception):
+    """Raised when frame preprocessing (resize/normalize) produces invalid data."""
+    pass
+
+
 class PipelineError(Exception):
     """Raised when the pipeline cannot complete a healthy run."""
     pass
@@ -85,6 +90,10 @@ MODEL_LOAD_MAX_RETRIES = 3
 MODEL_LOAD_INITIAL_DELAY = 0.5  # seconds
 MODEL_LOAD_BACKOFF_FACTOR = 2.0
 MODEL_LOAD_TIMEOUT = 10.0  # seconds
+
+# Retry configuration for frame preprocessing
+FRAME_PREPROCESS_MAX_RETRIES = 2
+FRAME_PREPROCESS_INITIAL_DELAY = 0.01  # seconds
 
 
 # ------------------------------------------------------------------
@@ -129,6 +138,65 @@ def _as_probabilities(scores: np.ndarray) -> np.ndarray:
     shifted = scores - np.max(scores)
     exp = np.exp(shifted)
     return exp / exp.sum()
+
+
+def _preprocess_frame_with_retry(
+    frame: np.ndarray,
+    target_size: tuple[int, int] = (224, 224),
+    max_retries: int = FRAME_PREPROCESS_MAX_RETRIES,
+) -> np.ndarray:
+    """Preprocess frame (resize and normalize) with validation and retry logic.
+
+    Validates that preprocessing does not introduce NaN/Inf before model inference.
+
+    Parameters
+    ----------
+    frame : np.ndarray
+        BGR image array.
+    target_size : tuple[int, int]
+        Target (width, height) for resize.
+    max_retries : int
+        Number of retry attempts if preprocessing produces invalid data.
+
+    Returns
+    -------
+    np.ndarray
+        Preprocessed blob ready for model input (NCHW format, float32).
+
+    Raises
+    ------
+    FramePreprocessingError
+        When preprocessing fails to produce valid data after all retries.
+    """
+    for attempt_num in range(1, max_retries + 1):
+        try:
+            blob = cv2.resize(frame, target_size).astype(np.float32) / 255.0
+
+            if not np.all(np.isfinite(blob)):
+                raise FramePreprocessingError(
+                    f"Resize produced NaN/Inf in blob (attempt {attempt_num}/{max_retries})"
+                )
+
+            blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
+
+            if not np.all(np.isfinite(blob)):
+                raise FramePreprocessingError(
+                    f"Transpose produced NaN/Inf in blob (attempt {attempt_num}/{max_retries})"
+                )
+
+            return blob
+
+        except FramePreprocessingError as e:
+            if attempt_num < max_retries:
+                log.warning(
+                    "Frame preprocessing failed: %s; retrying (attempt %d/%d)",
+                    e,
+                    attempt_num,
+                    max_retries,
+                )
+                time.sleep(FRAME_PREPROCESS_INITIAL_DELAY)
+            else:
+                raise
 
 
 class HelmetDetector:
@@ -216,8 +284,7 @@ class HelmetDetector:
         if frame is None or frame.size == 0:
             raise MissingFrameError("Frame is None or empty")
 
-        blob = cv2.resize(frame, (224, 224)).astype(np.float32) / 255.0
-        blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]  # NCHW
+        blob = _preprocess_frame_with_retry(frame, target_size=(224, 224))
 
         # Anything the runtime itself raises (shape mismatch, OOM, a broken
         # graph) is a real failure, not a malformed *output* — let it
@@ -500,7 +567,7 @@ def run_pipeline(
             # Throttle to approximate real-time playback on weak hardware
             time.sleep(frame_interval)
 
-        except (MissingFrameError, MalformedModelOutputError, InvalidAcousticScoreError) as e:
+        except (MissingFrameError, MalformedModelOutputError, InvalidAcousticScoreError, FramePreprocessingError) as e:
             consecutive_failures += 1
             log.error("Frame %05d | Processing failed: %s", frame_idx, e)
             if consecutive_failures >= MAX_CONSECUTIVE_FRAME_FAILURES:
