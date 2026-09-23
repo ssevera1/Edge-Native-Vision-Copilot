@@ -91,10 +91,6 @@ MODEL_LOAD_INITIAL_DELAY = 0.5  # seconds
 MODEL_LOAD_BACKOFF_FACTOR = 2.0
 MODEL_LOAD_TIMEOUT = 10.0  # seconds
 
-# Retry configuration for frame preprocessing
-FRAME_PREPROCESS_MAX_RETRIES = 2
-FRAME_PREPROCESS_INITIAL_DELAY = 0.01  # seconds
-
 
 # ------------------------------------------------------------------
 # Data structures
@@ -140,14 +136,16 @@ def _as_probabilities(scores: np.ndarray) -> np.ndarray:
     return exp / exp.sum()
 
 
-def _preprocess_frame_with_retry(
+def _preprocess_frame(
     frame: np.ndarray,
     target_size: tuple[int, int] = (224, 224),
-    max_retries: int = FRAME_PREPROCESS_MAX_RETRIES,
 ) -> np.ndarray:
-    """Preprocess frame (resize and normalize) with validation and retry logic.
+    """Preprocess frame (resize and normalize) for model input.
 
-    Validates that preprocessing does not introduce NaN/Inf before model inference.
+    Validates the input frame is free of NaN/Inf before it is resized and
+    normalised — resize and transpose are pure stride/arithmetic operations
+    on a validated array, so re-checking their output cannot catch anything
+    the input check did not already catch.
 
     Parameters
     ----------
@@ -155,8 +153,6 @@ def _preprocess_frame_with_retry(
         BGR image array.
     target_size : tuple[int, int]
         Target (width, height) for resize.
-    max_retries : int
-        Number of retry attempts if preprocessing produces invalid data.
 
     Returns
     -------
@@ -166,37 +162,14 @@ def _preprocess_frame_with_retry(
     Raises
     ------
     FramePreprocessingError
-        When preprocessing fails to produce valid data after all retries.
+        When the input frame contains NaN/Inf.
     """
-    for attempt_num in range(1, max_retries + 1):
-        try:
-            blob = cv2.resize(frame, target_size).astype(np.float32) / 255.0
+    if not np.all(np.isfinite(frame)):
+        raise FramePreprocessingError("Input frame contains NaN/Inf")
 
-            if not np.all(np.isfinite(blob)):
-                raise FramePreprocessingError(
-                    f"Resize produced NaN/Inf in blob (attempt {attempt_num}/{max_retries})"
-                )
-
-            blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
-
-            if not np.all(np.isfinite(blob)):
-                raise FramePreprocessingError(
-                    f"Transpose produced NaN/Inf in blob (attempt {attempt_num}/{max_retries})"
-                )
-
-            return blob
-
-        except FramePreprocessingError as e:
-            if attempt_num < max_retries:
-                log.warning(
-                    "Frame preprocessing failed: %s; retrying (attempt %d/%d)",
-                    e,
-                    attempt_num,
-                    max_retries,
-                )
-                time.sleep(FRAME_PREPROCESS_INITIAL_DELAY)
-            else:
-                raise
+    blob = cv2.resize(frame, target_size).astype(np.float32) / 255.0
+    blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
+    return blob
 
 
 class HelmetDetector:
@@ -284,7 +257,7 @@ class HelmetDetector:
         if frame is None or frame.size == 0:
             raise MissingFrameError("Frame is None or empty")
 
-        blob = _preprocess_frame_with_retry(frame, target_size=(224, 224))
+        blob = _preprocess_frame(frame, target_size=(224, 224))
 
         # Anything the runtime itself raises (shape mismatch, OOM, a broken
         # graph) is a real failure, not a malformed *output* — let it
