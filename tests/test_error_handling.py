@@ -13,6 +13,7 @@ import pytest
 from src import inference
 from src.inference import (
     DetectionResult,
+    FramePreprocessingError,
     HelmetDetector,
     InvalidAcousticScoreError,
     MalformedModelOutputError,
@@ -20,6 +21,7 @@ from src.inference import (
     PipelineError,
     SensorFusion,
     VideoIOError,
+    _preprocess_frame,
     frame_generator,
     main,
     run_pipeline,
@@ -123,6 +125,35 @@ class TestModelOutputValidation:
         detector = _detector_with(_FakeSession(exc=RuntimeError("input shape mismatch")))
         with pytest.raises(RuntimeError, match="input shape mismatch"):
             detector.detect(FRAME)
+
+
+class TestFramePreprocessing:
+    """`_preprocess_frame` must reject non-finite input and pass through good frames."""
+
+    def test_nan_frame_raises_preprocessing_error(self):
+        frame = np.zeros((48, 64, 3), dtype=np.float32)
+        frame[0, 0, 0] = np.nan
+        with pytest.raises(FramePreprocessingError):
+            _preprocess_frame(frame)
+
+    def test_inf_frame_raises_preprocessing_error(self):
+        frame = np.zeros((48, 64, 3), dtype=np.float32)
+        frame[0, 0, 0] = np.inf
+        with pytest.raises(FramePreprocessingError):
+            _preprocess_frame(frame)
+
+    def test_valid_frame_returns_normalised_nchw_blob(self):
+        blob = _preprocess_frame(FRAME)
+        assert blob.shape == (1, 3, 224, 224)
+        assert blob.dtype == np.float32
+        assert np.all(np.isfinite(blob))
+
+    def test_nan_frame_is_reported_as_preprocessing_failure_by_detector(self):
+        frame = np.zeros((48, 64, 3), dtype=np.float32)
+        frame[0, 0, 0] = np.nan
+        detector = _detector_with(_FakeSession(np.array([[0.9, 0.1]], dtype=np.float32)))
+        with pytest.raises(FramePreprocessingError):
+            detector.detect(frame)
 
 
 # ------------------------------------------------------------------

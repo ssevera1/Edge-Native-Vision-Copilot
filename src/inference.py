@@ -60,6 +60,11 @@ class InvalidAcousticScoreError(Exception):
     pass
 
 
+class FramePreprocessingError(Exception):
+    """Raised when frame preprocessing (resize/normalize) produces invalid data."""
+    pass
+
+
 class PipelineError(Exception):
     """Raised when the pipeline cannot complete a healthy run."""
     pass
@@ -129,6 +134,42 @@ def _as_probabilities(scores: np.ndarray) -> np.ndarray:
     shifted = scores - np.max(scores)
     exp = np.exp(shifted)
     return exp / exp.sum()
+
+
+def _preprocess_frame(
+    frame: np.ndarray,
+    target_size: tuple[int, int] = (224, 224),
+) -> np.ndarray:
+    """Preprocess frame (resize and normalize) for model input.
+
+    Validates the input frame is free of NaN/Inf before it is resized and
+    normalised — resize and transpose are pure stride/arithmetic operations
+    on a validated array, so re-checking their output cannot catch anything
+    the input check did not already catch.
+
+    Parameters
+    ----------
+    frame : np.ndarray
+        BGR image array.
+    target_size : tuple[int, int]
+        Target (width, height) for resize.
+
+    Returns
+    -------
+    np.ndarray
+        Preprocessed blob ready for model input (NCHW format, float32).
+
+    Raises
+    ------
+    FramePreprocessingError
+        When the input frame contains NaN/Inf.
+    """
+    if not np.all(np.isfinite(frame)):
+        raise FramePreprocessingError("Input frame contains NaN/Inf")
+
+    blob = cv2.resize(frame, target_size).astype(np.float32) / 255.0
+    blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
+    return blob
 
 
 class HelmetDetector:
@@ -216,8 +257,7 @@ class HelmetDetector:
         if frame is None or frame.size == 0:
             raise MissingFrameError("Frame is None or empty")
 
-        blob = cv2.resize(frame, (224, 224)).astype(np.float32) / 255.0
-        blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]  # NCHW
+        blob = _preprocess_frame(frame, target_size=(224, 224))
 
         # Anything the runtime itself raises (shape mismatch, OOM, a broken
         # graph) is a real failure, not a malformed *output* — let it
@@ -500,7 +540,7 @@ def run_pipeline(
             # Throttle to approximate real-time playback on weak hardware
             time.sleep(frame_interval)
 
-        except (MissingFrameError, MalformedModelOutputError, InvalidAcousticScoreError) as e:
+        except (MissingFrameError, MalformedModelOutputError, InvalidAcousticScoreError, FramePreprocessingError) as e:
             consecutive_failures += 1
             log.error("Frame %05d | Processing failed: %s", frame_idx, e)
             if consecutive_failures >= MAX_CONSECUTIVE_FRAME_FAILURES:
