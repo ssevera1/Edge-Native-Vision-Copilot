@@ -16,6 +16,7 @@ import math
 import numbers
 import random
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,6 +76,17 @@ class ModelLoadError(Exception):
     pass
 
 
+class OperationTimeoutError(Exception):
+    """Raised when an operation exceeds its timeout.
+
+    Deliberately not named ``TimeoutError``: that name is a builtin
+    (``OSError`` subclass) that socket/FFMPEG-backed I/O actually raises.
+    Shadowing it at module scope would make ``except TimeoutError``
+    elsewhere in this module silently stop matching the real builtin.
+    """
+    pass
+
+
 # Abort the run when this many frames in a row fail to be processed: a
 # systematically broken model must not finish with a green exit code.
 MAX_CONSECUTIVE_FRAME_FAILURES = 10
@@ -90,6 +102,9 @@ MODEL_LOAD_MAX_RETRIES = 3
 MODEL_LOAD_INITIAL_DELAY = 0.5  # seconds
 MODEL_LOAD_BACKOFF_FACTOR = 2.0
 MODEL_LOAD_TIMEOUT = 10.0  # seconds
+
+# Timeout for frame read operations (seconds)
+FRAME_READ_TIMEOUT = 5.0
 
 
 # ------------------------------------------------------------------
@@ -111,6 +126,75 @@ class AlertEvent:
     detection: DetectionResult
     acoustic_score: float
     message: str = ""
+
+
+# ------------------------------------------------------------------
+# Timeout utilities
+# ------------------------------------------------------------------
+
+def _call_with_timeout(func, args=(), kwargs=None, timeout_sec=5.0, context="operation"):
+    """Execute a function with a timeout.
+
+    Runs func(*args, **kwargs) in a daemon thread with a timeout.
+    Raises OperationTimeoutError if execution exceeds timeout_sec.
+
+    A thread cannot be forcibly interrupted, so on timeout the worker
+    keeps running in the background against whatever it was called with.
+    The raised exception carries a reference to that thread (``.thread``)
+    so a caller that owns a non-thread-safe resource (e.g. a
+    ``cv2.VideoCapture``) can avoid tearing it down while the orphaned
+    worker might still be using it.
+
+    Parameters
+    ----------
+    func : callable
+        Function to execute.
+    args : tuple
+        Positional arguments to func.
+    kwargs : dict or None
+        Keyword arguments to func.
+    timeout_sec : float
+        Timeout in seconds.
+    context : str
+        Human-readable context for error messages.
+
+    Returns
+    -------
+    Any
+        Return value of func.
+
+    Raises
+    ------
+    OperationTimeoutError
+        When execution exceeds timeout_sec.
+    """
+    if kwargs is None:
+        kwargs = {}
+
+    result_container = {}
+    exception_container = {}
+
+    def target():
+        try:
+            result_container['result'] = func(*args, **kwargs)
+        except Exception as e:
+            exception_container['exception'] = e
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_sec)
+
+    if thread.is_alive():
+        err = OperationTimeoutError(
+            f"{context} exceeded timeout of {timeout_sec}s"
+        )
+        err.thread = thread
+        raise err
+
+    if 'exception' in exception_container:
+        raise exception_container['exception']
+
+    return result_container.get('result')
 
 
 # ------------------------------------------------------------------
@@ -412,7 +496,8 @@ def frame_generator(video_path: str):
     VideoIOError
         When the video file cannot be opened or read.
     MissingFrameError
-        When a frame cannot be retrieved from the video stream.
+        When a frame cannot be retrieved from the video stream, including
+        when the read exceeds ``FRAME_READ_TIMEOUT``.
     """
     path = Path(video_path)
     if path.exists():
@@ -455,9 +540,23 @@ def frame_generator(video_path: str):
             )
 
         idx = 0
+        leaked_reader_thread = None
         try:
             while True:
-                ok, frame = cap.read()
+                try:
+                    ok, frame = _call_with_timeout(
+                        cap.read,
+                        timeout_sec=FRAME_READ_TIMEOUT,
+                        context="Frame read"
+                    )
+                except OperationTimeoutError as e:
+                    leaked_reader_thread = getattr(e, "thread", None)
+                    raise MissingFrameError(f"Frame {idx} read timeout from {path}: {e}") from e
+                except TimeoutError as e:
+                    # The builtin, not our watchdog: the underlying I/O (e.g. a
+                    # network-backed capture) timed out on its own.
+                    raise MissingFrameError(f"Frame {idx} read timeout from {path}: {e}") from e
+
                 if not ok:
                     if idx == 0:
                         raise MissingFrameError(f"Cannot read first frame from {path}")
@@ -467,7 +566,21 @@ def frame_generator(video_path: str):
                 yield idx, frame
                 idx += 1
         finally:
-            cap.release()
+            # A timed-out read leaves its worker thread running inside
+            # cap.read(); cv2.VideoCapture is not safe for concurrent use,
+            # so releasing here would race the orphaned thread's native call
+            # (use-after-free/crash). Leak the capture instead of releasing
+            # it out from under a still-running read.
+            if leaked_reader_thread is not None and leaked_reader_thread.is_alive():
+                log.error(
+                    "Frame read on %s did not finish within %.1fs; abandoning "
+                    "VideoCapture without releasing it because the read "
+                    "thread is still running",
+                    path,
+                    FRAME_READ_TIMEOUT,
+                )
+            else:
+                cap.release()
         log.info("Finished reading %d frames from %s", idx, path)
     else:
         log.warning("Video file not found (%s) — generating synthetic frames", path)
@@ -516,7 +629,10 @@ def run_pipeline(
     for frame_idx, frame in frame_generator(video_path):
         frames_seen += 1
         try:
-            # Simulate an acoustic anomaly score arriving from a microphone sensor
+            # Simulate an acoustic anomaly score arriving from a microphone sensor.
+            # This is in-process CPU work with no I/O, so it cannot hang — a
+            # timeout wrapper here would only add a thread spawn per frame.
+            # Add one when the real sensor fetch replaces this simulation.
             acoustic_score = round(random.uniform(0.0, 1.0), 3)
 
             detection = detector.detect(frame)
