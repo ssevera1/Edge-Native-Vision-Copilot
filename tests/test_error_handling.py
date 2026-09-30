@@ -7,6 +7,8 @@ from the one the validation code assumed.
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import pytest
 
@@ -381,3 +383,115 @@ class TestFrameGenerator:
         assert all(cap.released for cap in opened_caps)
         assert elapsed < inference.VIDEO_OPEN_TIMEOUT
         assert str(inference.VIDEO_OPEN_MAX_RETRIES) in str(exc_info.value)
+
+
+# ------------------------------------------------------------------
+# Frame read timeout
+# ------------------------------------------------------------------
+
+class _HangingCap:
+    """Fake VideoCapture whose read() blocks until the test unblocks it.
+
+    Stands in for a stalled decoder/network source to pin down the
+    per-frame timeout without a real multi-second sleep.
+    """
+
+    def __init__(self):
+        self.released = False
+        self._unblock = threading.Event()
+
+    def isOpened(self):
+        return True
+
+    def read(self):
+        self._unblock.wait(timeout=5.0)
+        return True, FRAME
+
+    def release(self):
+        self.released = True
+
+    def unblock(self):
+        self._unblock.set()
+
+
+class _RaisingCap:
+    """Fake VideoCapture whose read() raises immediately."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.released = False
+
+    def isOpened(self):
+        return True
+
+    def read(self):
+        raise self._exc
+
+    def release(self):
+        self.released = True
+
+
+class TestFrameReadTimeout:
+    """`frame_generator` must fail loudly, not hang or crash, on a stalled read."""
+
+    def test_hanging_read_is_reported_as_missing_frame(self, tmp_path, monkeypatch):
+        """A read stuck past FRAME_READ_TIMEOUT must surface as
+        MissingFrameError, not hang forever."""
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"fake")
+        cap = _HangingCap()
+        monkeypatch.setattr(inference.cv2, "VideoCapture", lambda _path: cap)
+        monkeypatch.setattr(inference, "FRAME_READ_TIMEOUT", 0.05)
+
+        try:
+            with pytest.raises(MissingFrameError, match="read timeout"):
+                list(frame_generator(str(video)))
+        finally:
+            cap.unblock()
+
+    def test_hanging_read_is_not_released_while_worker_thread_is_alive(
+        self, tmp_path, monkeypatch
+    ):
+        """The orphaned reader thread is still inside cap.read() when the
+        timeout fires; releasing the capture out from under it races the
+        native decoder (use-after-free). The capture must be leaked, not
+        released, while that thread is still running.
+        """
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"fake")
+        cap = _HangingCap()
+        monkeypatch.setattr(inference.cv2, "VideoCapture", lambda _path: cap)
+        monkeypatch.setattr(inference, "FRAME_READ_TIMEOUT", 0.05)
+
+        try:
+            with pytest.raises(MissingFrameError):
+                list(frame_generator(str(video)))
+            assert cap.released is False
+        finally:
+            cap.unblock()
+
+    def test_builtin_timeout_error_from_read_is_converted_to_missing_frame(
+        self, tmp_path, monkeypatch
+    ):
+        """cap.read() itself raising the *builtin* TimeoutError (e.g. a
+        network-backed capture hitting its own socket timeout) must convert
+        to MissingFrameError like any other failed read — it must not
+        escape uncaught because of a name clash with the module's own
+        timeout-watchdog exception.
+        """
+        video = tmp_path / "video.mp4"
+        video.write_bytes(b"fake")
+        cap = _RaisingCap(TimeoutError("socket timed out"))
+        monkeypatch.setattr(inference.cv2, "VideoCapture", lambda _path: cap)
+
+        with pytest.raises(MissingFrameError, match="read timeout"):
+            list(frame_generator(str(video)))
+        assert cap.released is True
+
+    def test_operation_timeout_error_does_not_shadow_builtin(self):
+        """Regression: the watchdog's own exception must not be named
+        ``TimeoutError`` — that rebinds the builtin at module scope and
+        makes ``except TimeoutError`` elsewhere in the module stop
+        matching genuine builtin TimeoutErrors."""
+        assert inference.OperationTimeoutError is not TimeoutError
+        assert not issubclass(inference.OperationTimeoutError, TimeoutError)
