@@ -16,6 +16,7 @@ import math
 import numbers
 import random
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -75,6 +76,11 @@ class ModelLoadError(Exception):
     pass
 
 
+class TimeoutError(Exception):
+    """Raised when an operation exceeds its timeout."""
+    pass
+
+
 # Abort the run when this many frames in a row fail to be processed: a
 # systematically broken model must not finish with a green exit code.
 MAX_CONSECUTIVE_FRAME_FAILURES = 10
@@ -90,6 +96,12 @@ MODEL_LOAD_MAX_RETRIES = 3
 MODEL_LOAD_INITIAL_DELAY = 0.5  # seconds
 MODEL_LOAD_BACKOFF_FACTOR = 2.0
 MODEL_LOAD_TIMEOUT = 10.0  # seconds
+
+# Timeout for frame read operations (seconds)
+FRAME_READ_TIMEOUT = 5.0
+
+# Timeout for acoustic score fetch operations (seconds)
+ACOUSTIC_SCORE_TIMEOUT = 2.0
 
 
 # ------------------------------------------------------------------
@@ -111,6 +123,66 @@ class AlertEvent:
     detection: DetectionResult
     acoustic_score: float
     message: str = ""
+
+
+# ------------------------------------------------------------------
+# Timeout utilities
+# ------------------------------------------------------------------
+
+def _call_with_timeout(func, args=(), kwargs=None, timeout_sec=5.0, context="operation"):
+    """Execute a function with a timeout.
+    
+    Runs func(*args, **kwargs) in a daemon thread with a timeout.
+    Raises TimeoutError if execution exceeds timeout_sec.
+    
+    Parameters
+    ----------
+    func : callable
+        Function to execute.
+    args : tuple
+        Positional arguments to func.
+    kwargs : dict or None
+        Keyword arguments to func.
+    timeout_sec : float
+        Timeout in seconds.
+    context : str
+        Human-readable context for error messages.
+    
+    Returns
+    -------
+    Any
+        Return value of func.
+    
+    Raises
+    ------
+    TimeoutError
+        When execution exceeds timeout_sec.
+    """
+    if kwargs is None:
+        kwargs = {}
+    
+    result_container = {}
+    exception_container = {}
+    
+    def target():
+        try:
+            result_container['result'] = func(*args, **kwargs)
+        except Exception as e:
+            exception_container['exception'] = e
+    
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_sec)
+    
+    if thread.is_alive():
+        raise TimeoutError(
+            f"{context} exceeded timeout of {timeout_sec}s"
+        )
+    
+    if 'exception' in exception_container:
+        raise exception_container['exception']
+    
+    return result_container.get('result')
 
 
 # ------------------------------------------------------------------
@@ -413,6 +485,8 @@ def frame_generator(video_path: str):
         When the video file cannot be opened or read.
     MissingFrameError
         When a frame cannot be retrieved from the video stream.
+    TimeoutError
+        When frame read exceeds timeout.
     """
     path = Path(video_path)
     if path.exists():
@@ -457,7 +531,15 @@ def frame_generator(video_path: str):
         idx = 0
         try:
             while True:
-                ok, frame = cap.read()
+                try:
+                    ok, frame = _call_with_timeout(
+                        cap.read,
+                        timeout_sec=FRAME_READ_TIMEOUT,
+                        context="Frame read"
+                    )
+                except TimeoutError as e:
+                    raise MissingFrameError(f"Frame {idx} read timeout from {path}: {e}") from e
+                
                 if not ok:
                     if idx == 0:
                         raise MissingFrameError(f"Cannot read first frame from {path}")
@@ -517,7 +599,14 @@ def run_pipeline(
         frames_seen += 1
         try:
             # Simulate an acoustic anomaly score arriving from a microphone sensor
-            acoustic_score = round(random.uniform(0.0, 1.0), 3)
+            try:
+                acoustic_score = _call_with_timeout(
+                    lambda: round(random.uniform(0.0, 1.0), 3),
+                    timeout_sec=ACOUSTIC_SCORE_TIMEOUT,
+                    context="Acoustic score fetch"
+                )
+            except TimeoutError as e:
+                raise InvalidAcousticScoreError(f"Acoustic score fetch timeout: {e}") from e
 
             detection = detector.detect(frame)
             alert = fusion.evaluate(frame, detection, acoustic_score)
