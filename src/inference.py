@@ -106,6 +106,9 @@ MODEL_LOAD_TIMEOUT = 10.0  # seconds
 # Timeout for frame read operations (seconds)
 FRAME_READ_TIMEOUT = 5.0
 
+# Timeout for acoustic score input (seconds)
+ACOUSTIC_SCORE_TIMEOUT = 2.0
+
 
 # ------------------------------------------------------------------
 # Data structures
@@ -382,6 +385,44 @@ class HelmetDetector:
 # Sensor Fusion
 # ------------------------------------------------------------------
 
+class AcousticScoreBuffer:
+    """Thread-safe buffer for acoustic anomaly scores.
+
+    Does not itself decide staleness — it just hands back the score's
+    age so the caller (``SensorFusion``, which owns ``acoustic_timeout``)
+    can make that call. Keeping the timeout in one place avoids two
+    timeout values drifting out of sync.
+    """
+
+    def __init__(self):
+        self.score = None
+        self.timestamp = None
+        self.lock = threading.Lock()
+
+    def put(self, score: float) -> None:
+        """Store a new acoustic score with current timestamp."""
+        with self.lock:
+            self.score = score
+            self.timestamp = time.time()
+
+    def get(self) -> tuple[float, float]:
+        """Retrieve the buffered score and its age in seconds.
+
+        Returns
+        -------
+        tuple[float, float]
+            (score, age_sec). If no score has been buffered yet, returns
+            ``(0.0, math.inf)`` so the caller's timeout check rejects it
+            regardless of the configured timeout.
+        """
+        with self.lock:
+            if self.score is None or self.timestamp is None:
+                return 0.0, math.inf
+
+            elapsed = time.time() - self.timestamp
+            return self.score, elapsed
+
+
 class SensorFusion:
     """Fuses visual detection with acoustic anomaly scoring.
 
@@ -390,20 +431,36 @@ class SensorFusion:
     acoustic_threshold : float
         Acoustic anomaly score above which the acoustic channel is
         considered to indicate danger (default 0.8).
+    acoustic_timeout : float
+        Maximum age of acoustic score in seconds (default 2.0).
     """
 
-    def __init__(self, acoustic_threshold: float = 0.8):
+    def __init__(
+        self,
+        acoustic_threshold: float = 0.8,
+        acoustic_timeout: float = ACOUSTIC_SCORE_TIMEOUT,
+    ):
         self.acoustic_threshold = acoustic_threshold
+        self.acoustic_timeout = acoustic_timeout
 
-    def _validate_acoustic_score(self, acoustic_score: float) -> None:
+    def _validate_acoustic_score(
+        self,
+        acoustic_score: float,
+        is_stale: bool = False,
+    ) -> None:
         """Validate acoustic anomaly score.
 
         Raises
         ------
         InvalidAcousticScoreError
-            When the score is None, non-numeric, boolean, NaN, Inf, or
-            outside [0.0, 1.0].
+            When the score is None, non-numeric, boolean, NaN, Inf,
+            outside [0.0, 1.0], or stale.
         """
+        if is_stale:
+            raise InvalidAcousticScoreError(
+                f"Acoustic score is stale (exceeded {self.acoustic_timeout}s timeout); "
+                "cannot proceed with fusion decision"
+            )
         if acoustic_score is None:
             raise InvalidAcousticScoreError(
                 "Acoustic score is None; cannot proceed with fusion decision"
@@ -435,6 +492,7 @@ class SensorFusion:
         frame: np.ndarray,
         detection: DetectionResult,
         acoustic_score: float,
+        score_age_sec: float = 0.0,
     ) -> Optional[AlertEvent]:
         """Return an AlertEvent if a safety violation is confirmed.
 
@@ -444,13 +502,26 @@ class SensorFusion:
           1. The visual model detects ``no_helmet``.
           2. The acoustic anomaly score exceeds ``acoustic_threshold``.
 
+        Parameters
+        ----------
+        frame : np.ndarray
+            Video frame (used for dimensions, not validation here).
+        detection : DetectionResult
+            Visual detection result.
+        acoustic_score : float
+            Acoustic anomaly score in [0.0, 1.0].
+        score_age_sec : float
+            Age of the acoustic score in seconds. If it exceeds
+            ``acoustic_timeout``, the score is rejected.
+
         Raises
         ------
         InvalidAcousticScoreError
-            When acoustic_score is None, non-numeric, boolean, NaN, Inf, or
-            out of range.
+            When acoustic_score is None, non-numeric, boolean, NaN, Inf,
+            out of range, or exceeds timeout.
         """
-        self._validate_acoustic_score(acoustic_score)
+        is_stale = score_age_sec > self.acoustic_timeout
+        self._validate_acoustic_score(acoustic_score, is_stale=is_stale)
 
         visual_violation = detection.label == "no_helmet"
         acoustic_violation = acoustic_score > self.acoustic_threshold
@@ -619,7 +690,11 @@ def run_pipeline(
         log.error("Model loading failed: %s", e)
         raise
 
-    fusion = SensorFusion(acoustic_threshold=acoustic_threshold)
+    fusion = SensorFusion(
+        acoustic_threshold=acoustic_threshold,
+        acoustic_timeout=ACOUSTIC_SCORE_TIMEOUT,
+    )
+    score_buffer = AcousticScoreBuffer()
 
     alert_count = 0
     frames_seen = 0
@@ -633,10 +708,25 @@ def run_pipeline(
             # This is in-process CPU work with no I/O, so it cannot hang — a
             # timeout wrapper here would only add a thread spawn per frame.
             # Add one when the real sensor fetch replaces this simulation.
+            #
+            # The put/get pair below is scaffolding: a real sensor feed would
+            # call put() from its own thread/process on its own cadence, while
+            # this loop calls get() on the frame cadence, so the two can drift
+            # apart and go stale. Here they run back-to-back on the same
+            # thread, so score_age is always ~0 and the timeout path is never
+            # exercised by this simulation (see tests for the enforcement
+            # itself, exercised directly against the buffer and SensorFusion).
             acoustic_score = round(random.uniform(0.0, 1.0), 3)
+            score_buffer.put(acoustic_score)
+            buffered_score, score_age = score_buffer.get()
 
             detection = detector.detect(frame)
-            alert = fusion.evaluate(frame, detection, acoustic_score)
+            alert = fusion.evaluate(
+                frame,
+                detection,
+                buffered_score,
+                score_age_sec=score_age,
+            )
 
             if alert is not None:
                 alert.frame_index = frame_idx
@@ -648,7 +738,7 @@ def run_pipeline(
                     frame_idx,
                     detection.label,
                     detection.confidence,
-                    acoustic_score,
+                    buffered_score,
                 )
 
             frames_processed += 1

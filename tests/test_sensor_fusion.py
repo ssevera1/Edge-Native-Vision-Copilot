@@ -123,6 +123,34 @@ class TestCustomThreshold:
 # AlertEvent payload correctness
 # ------------------------------------------------------------------
 
+class TestAcousticTimeoutBoundary:
+    """``score_age_sec`` vs. ``acoustic_timeout`` is strict greater-than (>)."""
+
+    def test_age_equal_to_timeout_is_not_stale(self, fusion: SensorFusion):
+        """age == timeout should NOT be rejected (> not >=)."""
+        result = fusion.evaluate(
+            DUMMY_FRAME, _det("no_helmet"), 0.95, score_age_sec=fusion.acoustic_timeout,
+        )
+        assert result is not None
+
+    def test_age_just_above_timeout_is_stale(self, fusion: SensorFusion):
+        from src.inference import InvalidAcousticScoreError
+
+        with pytest.raises(InvalidAcousticScoreError, match="stale"):
+            fusion.evaluate(
+                DUMMY_FRAME,
+                _det("no_helmet"),
+                0.95,
+                score_age_sec=fusion.acoustic_timeout + 0.001,
+            )
+
+    def test_age_well_below_timeout_is_accepted(self, fusion: SensorFusion):
+        result = fusion.evaluate(
+            DUMMY_FRAME, _det("no_helmet"), 0.95, score_age_sec=0.0,
+        )
+        assert result is not None
+
+
 class TestAlertPayload:
     """When an alert fires, verify the returned AlertEvent fields."""
 

@@ -7,6 +7,7 @@ from the one the validation code assumed.
 
 from __future__ import annotations
 
+import math
 import threading
 
 import numpy as np
@@ -14,6 +15,7 @@ import pytest
 
 from src import inference
 from src.inference import (
+    AcousticScoreBuffer,
     DetectionResult,
     FramePreprocessingError,
     HelmetDetector,
@@ -231,6 +233,75 @@ class TestAcousticScoreValidation:
         monkeypatch.setattr(inference.random, "uniform", lambda _a, _b: float("nan"))
         with pytest.raises(PipelineError):
             run_pipeline("whatever.mp4", frame_interval=0.0)
+
+    def test_stale_score_is_rejected(self, fusion: SensorFusion):
+        """A score older than ``acoustic_timeout`` must raise, not fuse."""
+        with pytest.raises(InvalidAcousticScoreError, match="stale"):
+            fusion.evaluate(
+                FRAME, _det(), 0.95, score_age_sec=fusion.acoustic_timeout + 0.5,
+            )
+
+    def test_stale_rejection_does_not_depend_on_the_score_value(self, fusion: SensorFusion):
+        """Staleness must be checked before the score is used for anything,
+        including a value that would otherwise sail through validation."""
+        with pytest.raises(InvalidAcousticScoreError, match="stale"):
+            fusion.evaluate(
+                FRAME, _det(), 0.5, score_age_sec=fusion.acoustic_timeout + 0.5,
+            )
+
+    def test_fresh_score_at_custom_timeout_is_accepted(self):
+        fusion = SensorFusion(acoustic_timeout=10.0)
+        assert fusion.evaluate(FRAME, _det(), 0.95, score_age_sec=5.0) is not None
+
+    def test_stale_score_aborts_the_run_after_consecutive_failures(self, monkeypatch):
+        """A sensor feed that never refreshes must trip the same abort path
+        as a malformed score — staleness is also a safety failure."""
+        monkeypatch.setattr(inference, "frame_generator", _stream(*[FRAME] * 500))
+        monkeypatch.setattr(
+            HelmetDetector,
+            "detect",
+            lambda self, frame: DetectionResult(label="helmet", confidence=0.9),
+        )
+        # Every read comes back far older than any configured timeout.
+        monkeypatch.setattr(AcousticScoreBuffer, "get", lambda self: (0.5, 999.0))
+        with pytest.raises(PipelineError):
+            run_pipeline("whatever.mp4", frame_interval=0.0)
+
+
+class TestAcousticScoreBuffer:
+    """Unit tests for the thread-safe score buffer used by ``run_pipeline``."""
+
+    def test_get_before_put_returns_infinite_age(self):
+        buf = AcousticScoreBuffer()
+        score, age = buf.get()
+        assert score == 0.0
+        assert age == math.inf
+
+    def test_put_then_get_returns_the_score_with_a_small_age(self):
+        buf = AcousticScoreBuffer()
+        buf.put(0.42)
+        score, age = buf.get()
+        assert score == 0.42
+        assert 0.0 <= age < 1.0
+
+    def test_score_age_grows_with_elapsed_time(self, monkeypatch):
+        """``get()`` must report the real elapsed time, not a fixed sentinel."""
+        times = iter([100.0, 103.0])
+        monkeypatch.setattr(inference.time, "time", lambda: next(times))
+        buf = AcousticScoreBuffer()
+        buf.put(0.42)
+        _score, age = buf.get()
+        assert age == pytest.approx(3.0)
+
+    def test_repeated_get_without_put_keeps_returning_the_last_score(self):
+        """``get()`` must not clear the buffer; repeated reads see the same
+        score with monotonically increasing age."""
+        buf = AcousticScoreBuffer()
+        buf.put(0.7)
+        score1, age1 = buf.get()
+        score2, age2 = buf.get()
+        assert score1 == score2 == 0.7
+        assert age2 >= age1
 
 
 # ------------------------------------------------------------------
