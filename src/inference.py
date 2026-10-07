@@ -386,16 +386,15 @@ class HelmetDetector:
 # ------------------------------------------------------------------
 
 class AcousticScoreBuffer:
-    """Thread-safe buffer for acoustic anomaly scores with timeout enforcement.
+    """Thread-safe buffer for acoustic anomaly scores.
 
-    Parameters
-    ----------
-    timeout_sec : float
-        Maximum age of a score before it is considered stale.
+    Does not itself decide staleness — it just hands back the score's
+    age so the caller (``SensorFusion``, which owns ``acoustic_timeout``)
+    can make that call. Keeping the timeout in one place avoids two
+    timeout values drifting out of sync.
     """
 
-    def __init__(self, timeout_sec: float = ACOUSTIC_SCORE_TIMEOUT):
-        self.timeout_sec = timeout_sec
+    def __init__(self):
         self.score = None
         self.timestamp = None
         self.lock = threading.Lock()
@@ -406,22 +405,22 @@ class AcousticScoreBuffer:
             self.score = score
             self.timestamp = time.time()
 
-    def get(self) -> tuple[float, bool]:
-        """Retrieve the buffered score and a flag indicating staleness.
+    def get(self) -> tuple[float, float]:
+        """Retrieve the buffered score and its age in seconds.
 
         Returns
         -------
-        tuple[float, bool]
-            (score, is_stale) where is_stale is True if the score exceeds
-            the timeout or no score has been buffered yet.
+        tuple[float, float]
+            (score, age_sec). If no score has been buffered yet, returns
+            ``(0.0, math.inf)`` so the caller's timeout check rejects it
+            regardless of the configured timeout.
         """
         with self.lock:
             if self.score is None or self.timestamp is None:
-                return 0.0, True
+                return 0.0, math.inf
 
             elapsed = time.time() - self.timestamp
-            is_stale = elapsed > self.timeout_sec
-            return self.score, is_stale
+            return self.score, elapsed
 
 
 class SensorFusion:
@@ -695,7 +694,7 @@ def run_pipeline(
         acoustic_threshold=acoustic_threshold,
         acoustic_timeout=ACOUSTIC_SCORE_TIMEOUT,
     )
-    score_buffer = AcousticScoreBuffer(timeout_sec=ACOUSTIC_SCORE_TIMEOUT)
+    score_buffer = AcousticScoreBuffer()
 
     alert_count = 0
     frames_seen = 0
@@ -709,10 +708,17 @@ def run_pipeline(
             # This is in-process CPU work with no I/O, so it cannot hang — a
             # timeout wrapper here would only add a thread spawn per frame.
             # Add one when the real sensor fetch replaces this simulation.
+            #
+            # The put/get pair below is scaffolding: a real sensor feed would
+            # call put() from its own thread/process on its own cadence, while
+            # this loop calls get() on the frame cadence, so the two can drift
+            # apart and go stale. Here they run back-to-back on the same
+            # thread, so score_age is always ~0 and the timeout path is never
+            # exercised by this simulation (see tests for the enforcement
+            # itself, exercised directly against the buffer and SensorFusion).
             acoustic_score = round(random.uniform(0.0, 1.0), 3)
             score_buffer.put(acoustic_score)
-            buffered_score, is_stale = score_buffer.get()
-            score_age = ACOUSTIC_SCORE_TIMEOUT if is_stale else 0.0
+            buffered_score, score_age = score_buffer.get()
 
             detection = detector.detect(frame)
             alert = fusion.evaluate(
