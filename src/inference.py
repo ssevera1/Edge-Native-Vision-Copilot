@@ -527,13 +527,15 @@ class SensorFusion:
         acoustic_violation = acoustic_score > self.acoustic_threshold
 
         if visual_violation and acoustic_violation:
-            log.info(
+            log.debug(
                 "Sensor fusion: ALERT triggered | "
-                "visual_confidence=%.3f, acoustic_score=%.3f > threshold=%.3f (decision=%.3f)",
+                "visual_confidence=%.3f, acoustic_score=%.3f, threshold=%.3f | "
+                "visual_violation=%s, acoustic_violation=%s",
                 detection.confidence,
                 acoustic_score,
                 self.acoustic_threshold,
-                max(detection.confidence, acoustic_score),
+                visual_violation,
+                acoustic_violation,
             )
             return AlertEvent(
                 frame_index=-1,  # caller fills this in
