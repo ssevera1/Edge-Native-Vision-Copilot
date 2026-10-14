@@ -182,3 +182,20 @@ class TestAlertPayload:
         assert alert is not None
         assert "0.87" in alert.message
         assert "0.92" in alert.message
+
+
+class TestFusionDecisionLogging:
+    """The alert log must describe the actual AND rule, not a fused score
+    that ``evaluate`` never computes."""
+
+    def test_alert_log_has_no_fabricated_decision_score(self, fusion: SensorFusion, caplog):
+        import logging
+
+        with caplog.at_level(logging.DEBUG, logger="safety-monitor"):
+            fusion.evaluate(DUMMY_FRAME, _det("no_helmet", 0.60), 0.95)
+
+        fusion_messages = [r.getMessage() for r in caplog.records if "Sensor fusion" in r.getMessage()]
+        assert fusion_messages, "expected a sensor fusion log record"
+        assert "decision=" not in fusion_messages[0]
+        assert "visual_violation=True" in fusion_messages[0]
+        assert "acoustic_violation=True" in fusion_messages[0]

@@ -526,17 +526,17 @@ class SensorFusion:
         visual_violation = detection.label == "no_helmet"
         acoustic_violation = acoustic_score > self.acoustic_threshold
 
-        log.debug(
-            "Fusion decision: visual_violation=%s (label=%s), "
-            "acoustic_violation=%s (score=%.3f > threshold=%.3f)",
-            visual_violation,
-            detection.label,
-            acoustic_violation,
-            acoustic_score,
-            self.acoustic_threshold,
-        )
-
         if visual_violation and acoustic_violation:
+            log.debug(
+                "Sensor fusion: ALERT triggered | "
+                "visual_confidence=%.3f, acoustic_score=%.3f, threshold=%.3f | "
+                "visual_violation=%s, acoustic_violation=%s",
+                detection.confidence,
+                acoustic_score,
+                self.acoustic_threshold,
+                visual_violation,
+                acoustic_violation,
+            )
             return AlertEvent(
                 frame_index=-1,  # caller fills this in
                 detection=detection,
@@ -546,6 +546,17 @@ class SensorFusion:
                     f"AND acoustic anomaly={acoustic_score:.2f} > "
                     f"{self.acoustic_threshold}"
                 ),
+            )
+        else:
+            log.debug(
+                "Sensor fusion: suppressed | "
+                "visual_confidence=%.3f, acoustic_score=%.3f, threshold=%.3f | "
+                "visual_violation=%s, acoustic_violation=%s",
+                detection.confidence,
+                acoustic_score,
+                self.acoustic_threshold,
+                visual_violation,
+                acoustic_violation,
             )
         return None
 
