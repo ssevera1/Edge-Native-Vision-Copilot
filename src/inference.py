@@ -109,6 +109,12 @@ FRAME_READ_TIMEOUT = 5.0
 # Timeout for acoustic score input (seconds)
 ACOUSTIC_SCORE_TIMEOUT = 2.0
 
+# Minimum valid frame dimensions (pixels)
+MIN_FRAME_WIDTH = 1
+MIN_FRAME_HEIGHT = 1
+MAX_FRAME_WIDTH = 8192
+MAX_FRAME_HEIGHT = 8192
+
 
 # ------------------------------------------------------------------
 # Data structures
@@ -223,15 +229,79 @@ def _as_probabilities(scores: np.ndarray) -> np.ndarray:
     return exp / exp.sum()
 
 
+def _validate_frame_dimensions(frame: np.ndarray, frame_idx: int) -> None:
+    """Validate frame dimensions to catch malformed video streams.
+
+    Checks for NaN/Inf pixels and validates spatial dimensions are within
+    acceptable ranges. Logs detailed dimension info for debugging.
+
+    Parameters
+    ----------
+    frame : np.ndarray
+        BGR image array to validate.
+    frame_idx : int
+        Frame index for logging context.
+
+    Raises
+    ------
+    FramePreprocessingError
+        When dimensions are invalid or frame contains NaN/Inf.
+    """
+    if frame is None or frame.size == 0:
+        raise FramePreprocessingError(
+            f"Frame {frame_idx}: array is None or empty"
+        )
+
+    if frame.ndim != 3:
+        raise FramePreprocessingError(
+            f"Frame {frame_idx}: expected 3D array (H, W, C), got shape {frame.shape}"
+        )
+
+    height, width, channels = frame.shape
+
+    if channels != 3:
+        raise FramePreprocessingError(
+            f"Frame {frame_idx}: expected 3 channels (BGR), got {channels}"
+        )
+
+    if width < MIN_FRAME_WIDTH or width > MAX_FRAME_WIDTH:
+        raise FramePreprocessingError(
+            f"Frame {frame_idx}: width {width} outside valid range "
+            f"[{MIN_FRAME_WIDTH}, {MAX_FRAME_WIDTH}]"
+        )
+
+    if height < MIN_FRAME_HEIGHT or height > MAX_FRAME_HEIGHT:
+        raise FramePreprocessingError(
+            f"Frame {frame_idx}: height {height} outside valid range "
+            f"[{MIN_FRAME_HEIGHT}, {MAX_FRAME_HEIGHT}]"
+        )
+
+    if not np.all(np.isfinite(frame)):
+        raise FramePreprocessingError(
+            f"Frame {frame_idx}: array contains NaN/Inf values "
+            f"(shape={frame.shape}, dtype={frame.dtype})"
+        )
+
+    log.debug(
+        "Frame %05d validated: dimensions=%dx%d, channels=%d, dtype=%s",
+        frame_idx,
+        width,
+        height,
+        channels,
+        frame.dtype,
+    )
+
+
 def _preprocess_frame(
     frame: np.ndarray,
     target_size: tuple[int, int] = (224, 224),
+    frame_idx: int = -1,
 ) -> np.ndarray:
     """Preprocess frame (resize and normalize) for model input.
 
-    Validates the input frame is free of NaN/Inf before it is resized and
-    normalised — resize and transpose are pure stride/arithmetic operations
-    on a validated array, so re-checking their output cannot catch anything
+    Validates the input frame dimensions and data before resize and
+    normalisation — these are pure stride/arithmetic operations on a
+    validated array, so re-checking their output cannot catch anything
     the input check did not already catch.
 
     Parameters
@@ -240,6 +310,8 @@ def _preprocess_frame(
         BGR image array.
     target_size : tuple[int, int]
         Target (width, height) for resize.
+    frame_idx : int
+        Frame index for logging and error context.
 
     Returns
     -------
@@ -249,10 +321,9 @@ def _preprocess_frame(
     Raises
     ------
     FramePreprocessingError
-        When the input frame contains NaN/Inf.
+        When the input frame contains NaN/Inf or has invalid dimensions.
     """
-    if not np.all(np.isfinite(frame)):
-        raise FramePreprocessingError("Input frame contains NaN/Inf")
+    _validate_frame_dimensions(frame, frame_idx)
 
     blob = cv2.resize(frame, target_size).astype(np.float32) / 255.0
     blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
@@ -333,18 +404,18 @@ class HelmetDetector:
             f"over {MODEL_LOAD_TIMEOUT}s: {model_path} (last error: {last_error})"
         )
 
-    def detect(self, frame: np.ndarray) -> DetectionResult:
+    def detect(self, frame: np.ndarray, frame_idx: int = -1) -> DetectionResult:
         """Run helmet detection on a single BGR frame."""
         if self.session is not None:
-            return self._infer_onnx(frame)
+            return self._infer_onnx(frame, frame_idx)
         return self._simulate(frame)
 
     # --- real inference path ------------------------------------------
-    def _infer_onnx(self, frame: np.ndarray) -> DetectionResult:
+    def _infer_onnx(self, frame: np.ndarray, frame_idx: int = -1) -> DetectionResult:
         if frame is None or frame.size == 0:
             raise MissingFrameError("Frame is None or empty")
 
-        blob = _preprocess_frame(frame, target_size=(224, 224))
+        blob = _preprocess_frame(frame, target_size=(224, 224), frame_idx=frame_idx)
 
         # Anything the runtime itself raises (shape mismatch, OOM, a broken
         # graph) is a real failure, not a malformed *output* — let it
@@ -731,7 +802,7 @@ def run_pipeline(
             score_buffer.put(acoustic_score)
             buffered_score, score_age = score_buffer.get()
 
-            detection = detector.detect(frame)
+            detection = detector.detect(frame, frame_idx=frame_idx)
             alert = fusion.evaluate(
                 frame,
                 detection,
