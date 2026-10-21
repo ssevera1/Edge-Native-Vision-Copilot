@@ -159,6 +159,36 @@ class TestFramePreprocessing:
         with pytest.raises(FramePreprocessingError):
             detector.detect(frame)
 
+    def test_wrong_ndim_raises_preprocessing_error(self):
+        """A grayscale (H, W) frame, not (H, W, C), must be rejected."""
+        frame = np.zeros((48, 64), dtype=np.uint8)
+        with pytest.raises(FramePreprocessingError, match="3D array"):
+            _preprocess_frame(frame)
+
+    def test_wrong_channel_count_raises_preprocessing_error(self):
+        """A BGRA (4-channel) frame from a mismatched capture backend must
+        be rejected rather than silently fed to a model expecting BGR."""
+        frame = np.zeros((48, 64, 4), dtype=np.uint8)
+        with pytest.raises(FramePreprocessingError, match="3 channels"):
+            _preprocess_frame(frame)
+
+    def test_oversized_width_raises_preprocessing_error(self):
+        frame = np.zeros((2, inference.MAX_FRAME_WIDTH + 1, 3), dtype=np.uint8)
+        with pytest.raises(FramePreprocessingError, match="width"):
+            _preprocess_frame(frame)
+
+    def test_oversized_height_raises_preprocessing_error(self):
+        frame = np.zeros((inference.MAX_FRAME_HEIGHT + 1, 2, 3), dtype=np.uint8)
+        with pytest.raises(FramePreprocessingError, match="height"):
+            _preprocess_frame(frame)
+
+    def test_empty_frame_via_detect_is_still_missing_frame_not_preprocessing(self):
+        """`_infer_onnx`'s empty-frame check must keep precedence over the
+        new dimension validation inside `_preprocess_frame`."""
+        detector = _detector_with(_FakeSession(np.array([[0.9, 0.1]], dtype=np.float32)))
+        with pytest.raises(MissingFrameError):
+            detector.detect(np.empty((0, 0, 3), dtype=np.uint8), frame_idx=7)
+
 
 # ------------------------------------------------------------------
 # Acoustic score validation
@@ -228,7 +258,7 @@ class TestAcousticScoreValidation:
         monkeypatch.setattr(
             HelmetDetector,
             "detect",
-            lambda self, frame: DetectionResult(label="helmet", confidence=0.9),
+            lambda self, frame, frame_idx=-1: DetectionResult(label="helmet", confidence=0.9),
         )
         monkeypatch.setattr(inference.random, "uniform", lambda _a, _b: float("nan"))
         with pytest.raises(PipelineError):
@@ -260,7 +290,7 @@ class TestAcousticScoreValidation:
         monkeypatch.setattr(
             HelmetDetector,
             "detect",
-            lambda self, frame: DetectionResult(label="helmet", confidence=0.9),
+            lambda self, frame, frame_idx=-1: DetectionResult(label="helmet", confidence=0.9),
         )
         # Every read comes back far older than any configured timeout.
         monkeypatch.setattr(AcousticScoreBuffer, "get", lambda self: (0.5, 999.0))
@@ -316,7 +346,7 @@ class TestPipelineFailureHandling:
         monkeypatch.setattr(
             HelmetDetector,
             "detect",
-            lambda self, frame: (_ for _ in ()).throw(MalformedModelOutputError("boom")),
+            lambda self, frame, frame_idx=-1: (_ for _ in ()).throw(MalformedModelOutputError("boom")),
         )
         with pytest.raises(PipelineError):
             run_pipeline("whatever.mp4", frame_interval=0.0)
@@ -326,7 +356,7 @@ class TestPipelineFailureHandling:
         monkeypatch.setattr(inference, "frame_generator", _stream(*[FRAME] * 500))
         seen = {"n": 0}
 
-        def _always_fail(self, frame):
+        def _always_fail(self, frame, frame_idx=-1):
             seen["n"] += 1
             raise MalformedModelOutputError("boom")
 
@@ -340,7 +370,7 @@ class TestPipelineFailureHandling:
         monkeypatch.setattr(inference, "frame_generator", _stream(*[FRAME] * 6))
         calls = {"n": 0}
 
-        def _fail_every_other(self, frame):
+        def _fail_every_other(self, frame, frame_idx=-1):
             calls["n"] += 1
             if calls["n"] % 2 == 0:
                 raise MalformedModelOutputError("boom")
@@ -379,7 +409,7 @@ class TestPipelineFailureHandling:
         monkeypatch.setattr(
             HelmetDetector,
             "detect",
-            lambda self, frame: (_ for _ in ()).throw(MalformedModelOutputError("boom")),
+            lambda self, frame, frame_idx=-1: (_ for _ in ()).throw(MalformedModelOutputError("boom")),
         )
         monkeypatch.setattr("sys.argv", ["inference.py", "--frame-interval", "0"])
         with pytest.raises(SystemExit) as exc:
@@ -391,7 +421,7 @@ class TestPipelineFailureHandling:
         monkeypatch.setattr(
             HelmetDetector,
             "detect",
-            lambda self, frame: inference.DetectionResult(label="helmet", confidence=0.9),
+            lambda self, frame, frame_idx=-1: inference.DetectionResult(label="helmet", confidence=0.9),
         )
         frames_processed, alerts = run_pipeline("whatever.mp4", frame_interval=0.0)
         assert frames_processed == 4
