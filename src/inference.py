@@ -109,9 +109,12 @@ FRAME_READ_TIMEOUT = 5.0
 # Timeout for acoustic score input (seconds)
 ACOUSTIC_SCORE_TIMEOUT = 2.0
 
-# Minimum valid frame dimensions (pixels)
-MIN_FRAME_WIDTH = 1
-MIN_FRAME_HEIGHT = 1
+# Upper bound on frame dimensions (pixels). A corrupted capture backend can
+# report a bogus resolution (e.g. a garbled width/height field) rather than
+# failing outright; at 8192x8192x3 uint8 a single frame is ~192 MB, which
+# alone blows the ~512 MB edge RAM budget (see module docstring). This
+# rejects that case before cv2.resize allocates the buffer, not because
+# any supported model or camera needs frames this large.
 MAX_FRAME_WIDTH = 8192
 MAX_FRAME_HEIGHT = 8192
 
@@ -264,16 +267,14 @@ def _validate_frame_dimensions(frame: np.ndarray, frame_idx: int) -> None:
             f"Frame {frame_idx}: expected 3 channels (BGR), got {channels}"
         )
 
-    if width < MIN_FRAME_WIDTH or width > MAX_FRAME_WIDTH:
+    if width > MAX_FRAME_WIDTH:
         raise FramePreprocessingError(
-            f"Frame {frame_idx}: width {width} outside valid range "
-            f"[{MIN_FRAME_WIDTH}, {MAX_FRAME_WIDTH}]"
+            f"Frame {frame_idx}: width {width} exceeds maximum {MAX_FRAME_WIDTH}"
         )
 
-    if height < MIN_FRAME_HEIGHT or height > MAX_FRAME_HEIGHT:
+    if height > MAX_FRAME_HEIGHT:
         raise FramePreprocessingError(
-            f"Frame {frame_idx}: height {height} outside valid range "
-            f"[{MIN_FRAME_HEIGHT}, {MAX_FRAME_HEIGHT}]"
+            f"Frame {frame_idx}: height {height} exceeds maximum {MAX_FRAME_HEIGHT}"
         )
 
     if not np.all(np.isfinite(frame)):
