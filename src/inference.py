@@ -489,6 +489,10 @@ class AcousticScoreBuffer:
         """
         with self.lock:
             if self.score is None or self.timestamp is None:
+                log.warning(
+                    "Acoustic score buffer underrun: no score buffered yet "
+                    "(insufficient acoustic data); returning default"
+                )
                 return 0.0, math.inf
 
             elapsed = time.time() - self.timestamp
