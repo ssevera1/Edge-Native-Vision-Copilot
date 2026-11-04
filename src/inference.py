@@ -103,6 +103,11 @@ MODEL_LOAD_INITIAL_DELAY = 0.5  # seconds
 MODEL_LOAD_BACKOFF_FACTOR = 2.0
 MODEL_LOAD_TIMEOUT = 10.0  # seconds
 
+# Retry configuration for frame preprocessing
+FRAME_PREPROCESS_MAX_RETRIES = 2
+FRAME_PREPROCESS_INITIAL_DELAY = 0.01  # seconds
+FRAME_PREPROCESS_BACKOFF_FACTOR = 2.0
+
 # Timeout for frame read operations (seconds)
 FRAME_READ_TIMEOUT = 5.0
 
@@ -331,6 +336,78 @@ def _preprocess_frame(
     return blob
 
 
+def _preprocess_frame_with_retry(
+    frame: np.ndarray,
+    target_size: tuple[int, int] = (224, 224),
+    frame_idx: int = -1,
+) -> np.ndarray:
+    """Preprocess frame with retry logic for transient failures.
+
+    Attempts frame preprocessing (resize/normalize) with exponential backoff
+    to surface transient failures that might otherwise silently degrade to
+    degraded-mode operation.
+
+    Parameters
+    ----------
+    frame : np.ndarray
+        BGR image array.
+    target_size : tuple[int, int]
+        Target (width, height) for resize.
+    frame_idx : int
+        Frame index for logging and error context.
+
+    Returns
+    -------
+    np.ndarray
+        Preprocessed blob ready for model input (NCHW format, float32).
+
+    Raises
+    ------
+    FramePreprocessingError
+        When preprocessing fails after all retry attempts.
+    """
+    last_error = None
+    delay = FRAME_PREPROCESS_INITIAL_DELAY
+
+    for attempt_num in range(1, FRAME_PREPROCESS_MAX_RETRIES + 1):
+        try:
+            blob = _preprocess_frame(frame, target_size, frame_idx)
+            if attempt_num > 1:
+                log.info(
+                    "Frame %05d preprocessing succeeded on attempt %d/%d",
+                    frame_idx,
+                    attempt_num,
+                    FRAME_PREPROCESS_MAX_RETRIES,
+                )
+            return blob
+        except FramePreprocessingError as e:
+            last_error = e
+            if attempt_num < FRAME_PREPROCESS_MAX_RETRIES:
+                log.warning(
+                    "Frame %05d preprocessing failed (attempt %d/%d): %s; "
+                    "retrying in %.3f s",
+                    frame_idx,
+                    attempt_num,
+                    FRAME_PREPROCESS_MAX_RETRIES,
+                    e,
+                    delay,
+                )
+                time.sleep(delay)
+                delay *= FRAME_PREPROCESS_BACKOFF_FACTOR
+            else:
+                log.error(
+                    "Frame %05d preprocessing failed after %d attempts: %s",
+                    frame_idx,
+                    FRAME_PREPROCESS_MAX_RETRIES,
+                    e,
+                )
+
+    raise FramePreprocessingError(
+        f"Frame {frame_idx} preprocessing failed after {FRAME_PREPROCESS_MAX_RETRIES} "
+        f"retries: {last_error}"
+    ) from last_error
+
+
 class HelmetDetector:
     """Wraps an ONNX helmet-detection model.
 
@@ -416,7 +493,7 @@ class HelmetDetector:
         if frame is None or frame.size == 0:
             raise MissingFrameError("Frame is None or empty")
 
-        blob = _preprocess_frame(frame, target_size=(224, 224), frame_idx=frame_idx)
+        blob = _preprocess_frame_with_retry(frame, target_size=(224, 224), frame_idx=frame_idx)
 
         # Anything the runtime itself raises (shape mismatch, OOM, a broken
         # graph) is a real failure, not a malformed *output* — let it
