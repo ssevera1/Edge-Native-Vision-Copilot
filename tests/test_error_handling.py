@@ -159,6 +159,20 @@ class TestFramePreprocessing:
         with pytest.raises(FramePreprocessingError):
             detector.detect(frame)
 
+    def test_detect_does_not_retry_on_deterministic_validation_failure(self, monkeypatch):
+        """Dimension validation is a pure function of the frame array: retrying
+        with the same frame can never succeed, so `detect` must not retry or
+        sleep, and must surface the original error message unmodified."""
+        sleep_calls = []
+        monkeypatch.setattr(inference.time, "sleep", lambda s: sleep_calls.append(s))
+
+        frame = np.zeros((48, 64, 4), dtype=np.uint8)  # wrong channel count
+        detector = _detector_with(_FakeSession(np.array([[0.9, 0.1]], dtype=np.float32)))
+        with pytest.raises(FramePreprocessingError, match=r"^Frame 7: expected 3 channels"):
+            detector.detect(frame, frame_idx=7)
+
+        assert sleep_calls == []
+
     def test_wrong_ndim_raises_preprocessing_error(self):
         """A grayscale (H, W) frame, not (H, W, C), must be rejected."""
         frame = np.zeros((48, 64), dtype=np.uint8)
