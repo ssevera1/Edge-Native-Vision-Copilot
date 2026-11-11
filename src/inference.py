@@ -342,6 +342,8 @@ class HelmetDetector:
 
     def __init__(self, model_path: Optional[str] = None):
         self.session: Optional["ort.InferenceSession"] = None
+        self.input_name: Optional[str] = None
+        self.expected_input_shape: Optional[tuple] = None
         if model_path and ort is not None:
             self._load_model_with_retry(model_path)
         else:
@@ -380,7 +382,9 @@ class HelmetDetector:
                 so.inter_op_num_threads = 1
                 self.session = ort.InferenceSession(model_path, sess_options=so)
                 self.input_name = self.session.get_inputs()[0].name
-                log.info("Successfully loaded ONNX model")
+                self.expected_input_shape = tuple(self.session.get_inputs()[0].shape)
+                log.info("Successfully loaded ONNX model, expected input shape: %s",
+                         self.expected_input_shape)
                 return
             except Exception as e:
                 last_error = e
@@ -412,11 +416,57 @@ class HelmetDetector:
         return self._simulate(frame)
 
     # --- real inference path ------------------------------------------
+    def _validate_input_tensor_shape(self, blob: np.ndarray, frame_idx: int) -> None:
+        """Validate preprocessed tensor shape matches model expectations.
+
+        Parameters
+        ----------
+        blob : np.ndarray
+            Preprocessed tensor in NCHW format.
+        frame_idx : int
+            Frame index for logging context.
+
+        Raises
+        ------
+        FramePreprocessingError
+            When tensor shape does not match model's expected input shape.
+        """
+        if self.expected_input_shape is None:
+            return
+
+        actual_shape = blob.shape
+        expected_shape = self.expected_input_shape
+
+        # Handle dynamic dimensions (represented as -1 or 'batch_size' in ONNX)
+        # Only validate static dimensions
+        if len(actual_shape) != len(expected_shape):
+            raise FramePreprocessingError(
+                f"Frame {frame_idx}: input tensor shape mismatch | "
+                f"expected rank {len(expected_shape)}, got {len(actual_shape)}"
+            )
+
+        for i, (actual, expected) in enumerate(zip(actual_shape, expected_shape)):
+            # Skip validation for dynamic dimensions (represented as -1 or other symbolic values)
+            if isinstance(expected, int) and expected > 0:
+                if actual != expected:
+                    raise FramePreprocessingError(
+                        f"Frame {frame_idx}: input tensor shape mismatch at dimension {i} | "
+                        f"expected {expected}, got {actual} | "
+                        f"expected shape {expected_shape}, actual shape {actual_shape}"
+                    )
+
+        log.debug(
+            "Frame %05d: input tensor shape validated: %s",
+            frame_idx,
+            actual_shape,
+        )
+
     def _infer_onnx(self, frame: np.ndarray, frame_idx: int = -1) -> DetectionResult:
         if frame is None or frame.size == 0:
             raise MissingFrameError("Frame is None or empty")
 
         blob = _preprocess_frame(frame, target_size=(224, 224), frame_idx=frame_idx)
+        self._validate_input_tensor_shape(blob, frame_idx)
 
         # Anything the runtime itself raises (shape mismatch, OOM, a broken
         # graph) is a real failure, not a malformed *output* — let it
